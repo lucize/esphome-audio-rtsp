@@ -322,13 +322,14 @@ means I2S0. Use I2S1 only if another component is already using I2S0.
 
 This component exposes an audio-only RTSP stream. Some consumers handle audio-only RTSP better than others. If direct Frigate use is unreliable, put `go2rtc` in between and let Frigate consume the go2rtc stream.
 
-## Source and implementation notes
+## Credits / Inspiration
 
-The first working prototype used Phil Schatzmann's Arduino AudioTools RTSP example as a reference point for proving that audio-only RTSP could be useful on this hardware:
+This project was inspired by Phil Schatzmann's Arduino Audio Tools RTSP audio example:
 
-- Repository: `pschatzmann/arduino-audio-tools`
-- Example: `examples/examples-communication/rtsp/communication-audiokit-rtsp/communication-audiokit-rtsp.ino`
+- [Arduino Audio Tools](https://github.com/pschatzmann/arduino-audio-tools)
+- [communication-audiokit-rtsp.ino example](https://github.com/pschatzmann/arduino-audio-tools/blob/main/examples/examples-communication/rtsp/communication-audiokit-rtsp/communication-audiokit-rtsp.ino)
 
+The first prototype used Arduino Audio Tools to validate the idea of streaming ESP32 microphone audio over RTSP. This project was then rewritten as a minimal native ESP-IDF ESPHome external component using ESP-IDF I2S and lwIP sockets.
 This native ESP-IDF component does **not** copy or link Arduino AudioTools. It reimplements the minimal pieces needed for this ESPHome use case:
 
 - ESP-IDF I2S STD microphone input via `esp_driver_i2s` / `driver/i2s_std.h`
@@ -343,4 +344,4 @@ The implementation is intentionally compact and practical rather than a complete
 
 ## License
 
-No license is declared yet. Add a license before publishing publicly if you want others to reuse or modify the code under clear terms.
+GPL-3.0 license
