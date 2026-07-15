@@ -1,0 +1,58 @@
+esphome:
+  name: mic-front
+  friendly_name: mic-front
+
+external_components:
+  - source: github://lucize/esphome-audio-rtsp@main
+    components: [rtsp_audio]
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  logs:
+    rtsp_audio: DEBUG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: mic-front Fallback Hotspot
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+rtsp_audio:
+  bclk_pin: GPIO26
+  lrclk_pin: GPIO25
+  din_pin: GPIO27
+
+  adc_type: external
+  pdm: false
+
+  port: 8554
+  sample_rate: 16000
+  bits_per_sample: 32bit
+  channel: left
+
+  i2s_port: 0
+  use_stereo_slot: false
+  sample_shift: 14
+  gain: 4.0
+  use_apll: false
+
+  rtp_payload_type: 96
+  packet_ms: 20
+  debug: true
+  status_interval: 10s
