@@ -1,84 +1,73 @@
 # ESPHome Audio RTSP
 
-Minimal audio-only RTSP server for ESPHome using an ESP32 and an I2S microphone such as the INMP441.
+Minimal ESPHome external component that exposes an ESPHome `microphone:` entity as an audio-only RTSP stream.
 
-This project is **vibecoded by ChatGPT** together with hands-on user testing, ESPHome logs, and iterative fixes. Treat it as an experimental community component, not an official ESPHome component.
+It is intended for ESP32 + I2S microphones such as the INMP441, but the RTSP component itself no longer owns the I2S peripheral. The normal ESPHome `i2s_audio:` and `microphone:` components configure and read the microphone; `rtsp_audio:` consumes that microphone stream and packetizes it as RTP/L16 over RTSP.
 
-## What it does
-
-```text
-INMP441 / I2S microphone
-  -> ESP-IDF I2S STD RX driver
-  -> signed 16-bit PCM conversion
-  -> RTP L16 mono packets over UDP
-  -> minimal RTSP control server
-  -> VLC / ffplay / go2rtc / Frigate-compatible input, depending on client support
-```
-
-The component is intentionally small. It does not use Arduino, `WiFi.h`, Arduino AudioTools, or ESPHome's built-in `i2s_audio` / `microphone` component.
+> This project was vibecoded by ChatGPT and Claude, with testing and iteration on real ESPHome/ESP32 hardware.
 
 ## Status
 
-Tested baseline:
+Experimental. It is a minimal audio-only RTSP server, not a full camera/media framework.
 
-- ESPHome `2026.6.5`
-- ESP32 rev3.1 / `esp32dev`
-- ESP-IDF framework
-- INMP441-style I2S microphone
-- RTSP port `8554`
+Supported today:
 
-Known-good audio baseline from testing:
+- ESP32 with `framework.type: esp-idf`
+- ESPHome `microphone:` input
+- RTSP control over TCP
+- RTP audio over UDP
+- L16 / signed 16-bit PCM / mono
+- One active RTSP client at a time
+
+Not supported yet:
+
+- RTSP interleaved TCP RTP
+- AAC/Opus encoding
+- Authentication
+- Multiple simultaneous RTSP clients
+
+## Runtime behavior and optimizations
+
+The component intentionally uses ESPHome's native `i2s_audio:` / `microphone:` stack instead of opening the I2S peripheral itself. The RTSP server starts at boot, but microphone capture is started only while an RTSP client is in `PLAY` state and stopped again when streaming ends.
+
+Current low-risk optimizations:
+
+- RTP sender task is separate from the RTSP control task.
+- Microphone callbacks never block; overflow is counted as `drop=` in debug logs.
+- The audio buffer trigger is aligned to one RTP packet instead of waking on tiny partial chunks.
+- The audio buffer is reset on `PLAY` to avoid stale buffered audio and reduce initial delay.
+- RTSP control sockets use `TCP_NODELAY`.
+- RTP UDP send buffer is enlarged to reduce short Wi-Fi/lwIP backpressure bursts.
+- RTP send warnings are throttled so logging does not make audio glitches worse.
+
+Recommended stable defaults:
 
 ```yaml
-use_stereo_slot: false
-sample_shift: 14
-gain: 4.0
 packet_ms: 20
+buffer_ms: 200
+gain_factor: 4
 ```
 
-`use_stereo_slot: false` is important for the tested INMP441 setup. Stereo slot mode caused robotic/chopped audio during testing.
+Lower `buffer_ms` can reduce latency but increases the chance of dropouts on weak Wi-Fi. Higher `buffer_ms` can smooth jitter but adds delay.
 
-## Features
+## Credits / inspiration
 
-- Native ESP-IDF only
-- ESP-IDF 5 I2S STD driver
-- lwIP TCP RTSP listener
-- lwIP UDP RTP audio streaming
-- Dynamic RTP client ports from RTSP `SETUP`
-- One active RTSP client
-- L16 mono PCM RTP payload
-- Software gain
-- Configurable sample extraction shift for 32-bit I2S microphones
-- Debug counters for packets, send errors, clipping, I2S reads, and peak/min/max
-- ESPHome-style YAML aliases for I2S pin names
+Inspired by Phil Schatzmann's Arduino Audio Tools RTSP example:
 
-## Limitations
+- [Arduino Audio Tools](https://github.com/pschatzmann/arduino-audio-tools)
+- [communication-audiokit-rtsp.ino example](https://github.com/pschatzmann/arduino-audio-tools/blob/main/examples/examples-communication/rtsp/communication-audiokit-rtsp/communication-audiokit-rtsp.ino)
 
-- RTP over UDP only
-- No RTSP interleaved TCP transport yet
-- No RTCP sender reports yet
-- One client at a time
-- Raw L16 PCM only; no AAC, Opus, or MP3 compression
-- The component owns the I2S peripheral directly; do not also configure ESPHome `i2s_audio:` / `microphone:` for the same pins
-
-## Repository layout
-
-For ESPHome remote fetching, the component is stored under:
-
-```text
-components/rtsp_audio
-```
-
-ESPHome expects git-sourced external components to live inside a repository `components` folder or `esphome/components` folder.
+The first proof of concept used Arduino Audio Tools to validate the idea. This repository is a separate ESPHome / ESP-IDF implementation and does not use Arduino Audio Tools at runtime.
 
 ## Install from GitHub
 
-Use the repository directly from ESPHome:
+Use the repository as an ESPHome external component:
 
 ```yaml
 external_components:
   - source: github://lucize/esphome-audio-rtsp@main
     components: [rtsp_audio]
+    refresh: 0s
 ```
 
 Alternative explicit git syntax:
@@ -90,37 +79,12 @@ external_components:
       url: https://github.com/lucize/esphome-audio-rtsp.git
       ref: main
     components: [rtsp_audio]
+    refresh: 0s
 ```
 
-If you publish tagged releases, pin a tag instead of `main` for reproducible builds:
+For normal long-term use you can remove `refresh: 0s` after the component is stable. Keeping it during development avoids ESPHome using a cached older schema.
 
-```yaml
-external_components:
-  - source: github://lucize/esphome-audio-rtsp@v0.1.0
-    components: [rtsp_audio]
-```
-
-## Local install
-
-Clone or copy this repository into your ESPHome config directory and point ESPHome at the local `components` folder:
-
-```yaml
-external_components:
-  - source:
-      type: local
-      path: components
-    components: [rtsp_audio]
-```
-
-If replacing an older local copy, delete the old folder first:
-
-```bash
-rm -rf /config/components/rtsp_audio
-```
-
-If the ESPHome dashboard editor still shows old schema errors, restart the ESPHome add-on/container or use **Clean Build Files**.
-
-## Full YAML example
+## Example configuration
 
 ```yaml
 esphome:
@@ -130,6 +94,7 @@ esphome:
 external_components:
   - source: github://lucize/esphome-audio-rtsp@main
     components: [rtsp_audio]
+    refresh: 0s
 
 esp32:
   board: esp32dev
@@ -142,6 +107,8 @@ logger:
     rtsp_audio: DEBUG
 
 api:
+  encryption:
+    key: !secret api_encryption_key
 
 ota:
   - platform: esphome
@@ -151,27 +118,32 @@ wifi:
   password: !secret wifi_password
   power_save_mode: none
 
+captive_portal:
+
+i2s_audio:
+  - id: i2s_in
+    i2s_lrclk_pin: GPIO25   # INMP441 WS / LRCLK
+    i2s_bclk_pin: GPIO26    # INMP441 SCK / BCLK
+
+microphone:
+  - platform: i2s_audio
+    id: inmp441_mic
+    i2s_audio_id: i2s_in
+    i2s_din_pin: GPIO27     # INMP441 SD / DOUT
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: left           # INMP441 L/R wiring; try right if silent
+
 rtsp_audio:
-  bclk_pin: GPIO26
-  lrclk_pin: GPIO25
-  din_pin: GPIO27
-
-  adc_type: external
-  pdm: false
-
+  microphone: inmp441_mic
   port: 8554
-  sample_rate: 16000
-  bits_per_sample: 32bit
-  channel: left
-
-  i2s_port: 0
-  use_stereo_slot: false
-  sample_shift: 14
-  gain: 4.0
-  use_apll: false
-
+  audio_channel: 0          # microphone output channel index; mono mic = 0
+  gain_factor: 4            # 1-64 integer gain
   rtp_payload_type: 96
   packet_ms: 20
+  buffer_ms: 200
   debug: true
   status_interval: 10s
 ```
@@ -193,83 +165,35 @@ rtsp://0.0.0.0:8554/
 ```
 
 Do not use `0.0.0.0` as the real client URL. It only means "bind/listen on all local interfaces" in server-side examples; clients must connect to the ESP32's actual IP or hostname.
+## Test with ffplay
 
-## ESPHome-like pin aliases
+This component currently supports RTP over UDP. Do not force RTSP-over-TCP/interleaved transport.
 
-The short names are recommended:
-
-```yaml
-bclk_pin: GPIO26
-lrclk_pin: GPIO25
-din_pin: GPIO27
+```bash
+ffplay rtsp://<esp32-ip>:8554/
 ```
 
-The component also accepts ESPHome-like aliases:
+or:
 
-```yaml
-i2s_bclk_pin: GPIO26
-i2s_lrclk_pin: GPIO25
-i2s_din_pin: GPIO27
+```bash
+ffplay rtsp://mic-front.local:8554/
 ```
-
-Use one style or the other, not both.
 
 ## Configuration reference
 
-| Option | Default | Notes |
-|---|---:|---|
-| `bclk_pin` / `i2s_bclk_pin` | required | I2S BCLK / SCK |
-| `lrclk_pin` / `i2s_lrclk_pin` | required | I2S LRCLK / WS |
-| `din_pin` / `i2s_din_pin` | required | I2S data input from microphone |
-| `adc_type` | `external` | Only `external` is supported |
-| `pdm` | `false` | PDM is not supported |
-| `port` | `8554` | RTSP TCP control port |
-| `sample_rate` | `16000` | RTP clock and I2S sample rate |
-| `bits_per_sample` | `32bit` | Input I2S sample width. `32bit` is typical for INMP441 |
-| `channel` | `left` | Use `right` if your INMP441 L/R pin is wired for right channel |
-| `i2s_port` | `0` | ESP32 I2S controller: `0` or `1` |
-| `use_stereo_slot` | `false` | Keep `false` for the tested INMP441 setup |
-| `sample_shift` | `14` | Right shift applied to 32-bit raw samples before gain |
-| `gain` | `1.0` | Software gain after shifting |
-| `use_apll` | `false` | Optional APLL clock source |
-| `rtp_payload_type` | `96` | Dynamic RTP payload type for L16 |
-| `packet_ms` | `20` | RTP packet duration |
-| `debug` | `false` | Enables periodic stats |
-| `status_interval` | `10s` | Debug status interval |
+### `rtsp_audio:`
 
-## Audio tuning
-
-Start with:
-
-```yaml
-use_stereo_slot: false
-sample_shift: 14
-gain: 4.0
-packet_ms: 20
-```
-
-If audio is too quiet:
-
-```yaml
-sample_shift: 12
-gain: 2.0
-```
-
-If audio is distorted, robotic, or chopped and the logs show clipping:
-
-```yaml
-sample_shift: 14
-gain: 2.0
-```
-
-Avoid very aggressive settings such as:
-
-```yaml
-sample_shift: 10
-gain: 2.0
-```
-
-That can clip heavily with INMP441 and sound robotic.
+| Option | Required | Default | Description |
+|---|---:|---:|---|
+| `microphone` | yes | | ID of the ESPHome `microphone:` entity to stream. |
+| `port` | no | `8554` | RTSP TCP control port. |
+| `audio_channel` | no | `0` | Output channel index from the microphone source. For a mono INMP441 mic, use `0`. |
+| `gain_factor` | no | `4` | Integer microphone gain factor, 1-64. |
+| `rtp_payload_type` | no | `96` | Dynamic RTP payload type used for L16 audio. |
+| `packet_ms` | no | `20` | Audio per RTP packet, in milliseconds. |
+| `buffer_ms` | no | `200` | Microphone-to-RTP buffer size in milliseconds. Lower reduces latency; higher tolerates more jitter. |
+| `debug` | no | `false` | Enables periodic status/debug logging. |
+| `status_interval` | no | `10s` | Debug status log interval. |
 
 ## Testing
 
@@ -308,39 +232,11 @@ Typical interpretation:
 - `packets` and `i2s_reads` increase but `peak=0 min=0 max=0`: try `channel: right` or check INMP441 L/R wiring.
 - `send_err` increasing: UDP RTP packets are not leaving the ESP32 reliably; check Wi-Fi, VLAN/firewall, or client behavior.
 
-## i2s_port
-
-ESP32 has two I2S hardware controllers: I2S0 and I2S1.
-
-```yaml
-i2s_port: 0
-```
-
-means I2S0. Use I2S1 only if another component is already using I2S0.
 
 ## Notes for Frigate/go2rtc
 
 This component exposes an audio-only RTSP stream. Some consumers handle audio-only RTSP better than others. If direct Frigate use is unreliable, put `go2rtc` in between and let Frigate consume the go2rtc stream.
 
-## Credits / Inspiration
-
-This project was inspired by Phil Schatzmann's Arduino Audio Tools RTSP audio example:
-
-- [Arduino Audio Tools](https://github.com/pschatzmann/arduino-audio-tools)
-- [communication-audiokit-rtsp.ino example](https://github.com/pschatzmann/arduino-audio-tools/blob/main/examples/examples-communication/rtsp/communication-audiokit-rtsp/communication-audiokit-rtsp.ino)
-
-The first prototype used Arduino Audio Tools to validate the idea of streaming ESP32 microphone audio over RTSP. This project was then rewritten as a minimal native ESP-IDF ESPHome external component using ESP-IDF I2S and lwIP sockets.
-This native ESP-IDF component does **not** copy or link Arduino AudioTools. It reimplements the minimal pieces needed for this ESPHome use case:
-
-- ESP-IDF I2S STD microphone input via `esp_driver_i2s` / `driver/i2s_std.h`
-- TCP socket server for RTSP control
-- RTSP methods: `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, `TEARDOWN`
-- SDP generation for `L16/<sample_rate>/1`
-- UDP sockets for RTP
-- RTP header creation, sequence numbers, timestamps, and SSRC
-- 32-bit I2S sample conversion to signed 16-bit big-endian PCM for RTP L16
-
-The implementation is intentionally compact and practical rather than a complete RTSP stack.
 
 ## License
 
