@@ -18,12 +18,13 @@ Supported today:
 - RTP audio over UDP
 - L16 / signed 16-bit PCM / mono
 - One active RTSP client at a time
+- Optional RTSP Basic authentication
+
 
 Not supported yet:
 
 - RTSP interleaved TCP RTP
 - AAC/Opus encoding
-- Authentication
 - Multiple simultaneous RTSP clients
 
 ## Runtime behavior and optimizations
@@ -146,6 +147,11 @@ rtsp_audio:
   buffer_ms: 200
   debug: true
   status_interval: 10s
+
+  # Optional RTSP Basic authentication. Omit both to disable auth.
+  username: !secret rtsp_username
+  password: !secret rtsp_password
+  auth_realm: ESPHome RTSP Audio
 ```
 
 ## RTSP URL examples
@@ -194,6 +200,9 @@ ffplay rtsp://mic-front.local:8554/
 | `buffer_ms` | no | `200` | Microphone-to-RTP buffer size in milliseconds. Lower reduces latency; higher tolerates more jitter. |
 | `debug` | no | `false` | Enables periodic status/debug logging. |
 | `status_interval` | no | `10s` | Debug status log interval. |
+| `username` | no | | RTSP Basic auth username. Must be set together with `password`. |
+| `password` | no | | RTSP Basic auth password. Must be set together with `username`. |
+| `auth_realm` | no | `ESPHome RTSP Audio` | Realm shown in the RTSP `WWW-Authenticate` challenge. |
 
 ## Testing
 
