@@ -1,11 +1,11 @@
 #include "rtsp_audio.h"
 
 #include <algorithm>
-#include <cinttypes>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <cinttypes>
 #include <vector>
 
 #include "esp_err.h"
@@ -65,6 +65,7 @@ void RTSPAudioComponent::setup() {
 
   audio::AudioStreamInfo info = this->mic_source_->get_audio_stream_info();
   this->sample_rate_ = info.get_sample_rate();
+  this->configure_codec_();
 
   // Small buffer between the microphone callback and RTP sender. Keeping this
   // low avoids building up noticeable latency; the trigger level is one RTP
@@ -96,8 +97,8 @@ void RTSPAudioComponent::setup() {
   }
   this->started_ = true;
   this->last_error_ = "none";
-  ESP_LOGI(TAG, "Native RTSP audio server task started on port %d (microphone: %u Hz)", this->port_,
-           (unsigned) this->sample_rate_);
+  ESP_LOGI(TAG, "Native RTSP audio server task started on port %d (microphone: %u Hz, codec: %s/%d)", this->port_,
+           (unsigned) this->sample_rate_, this->rtpmap_name_(), this->output_sample_rate_);
   ESP_LOGI(TAG, "RTSP URL: rtsp://%s:%d/", this->local_ip_().c_str(), this->port_);
 }
 
@@ -266,6 +267,97 @@ void RTSPAudioComponent::send_auth_required_(int fd, int cseq) {
   this->send_rtsp_response_(fd, 401, "Unauthorized", cseq, h, "");
 }
 
+
+const char *RTSPAudioComponent::codec_name_() const {
+  switch (this->codec_) {
+    case AudioCodec::PCMU:
+      return "pcmu";
+    case AudioCodec::PCMA:
+      return "pcma";
+    case AudioCodec::L16:
+    default:
+      return "l16";
+  }
+}
+
+const char *RTSPAudioComponent::rtpmap_name_() const {
+  switch (this->codec_) {
+    case AudioCodec::PCMU:
+      return "PCMU";
+    case AudioCodec::PCMA:
+      return "PCMA";
+    case AudioCodec::L16:
+    default:
+      return "L16";
+  }
+}
+
+void RTSPAudioComponent::configure_codec_() {
+  if (this->codec_ == AudioCodec::L16) {
+    this->output_sample_rate_ = this->sample_rate_;
+    if (!this->rtp_payload_type_user_set_) this->rtp_payload_type_ = 96;
+    return;
+  }
+
+  this->output_sample_rate_ = this->output_sample_rate_config_ > 0 ? this->output_sample_rate_config_ : 8000;
+  if (!this->rtp_payload_type_user_set_) {
+    this->rtp_payload_type_ = (this->codec_ == AudioCodec::PCMA) ? 8 : 0;
+  }
+
+  if (this->sample_rate_ < this->output_sample_rate_) {
+    ESP_LOGW(TAG, "Codec %s requested output_sample_rate=%d but microphone sample_rate=%d; output will run at microphone rate",
+             this->codec_name_(), this->output_sample_rate_, this->sample_rate_);
+    this->output_sample_rate_ = this->sample_rate_;
+  } else if (this->sample_rate_ % this->output_sample_rate_ != 0) {
+    ESP_LOGW(TAG, "Codec %s uses simple nearest-sample resampling from %d Hz to %d Hz; prefer integer ratios such as 16000->8000",
+             this->codec_name_(), this->sample_rate_, this->output_sample_rate_);
+  }
+}
+
+uint8_t RTSPAudioComponent::linear_to_ulaw_(int16_t sample) {
+  static constexpr int BIAS = 0x84;
+  static constexpr int CLIP = 32635;
+  int sign = 0;
+  int pcm = sample;
+  if (pcm < 0) {
+    pcm = -pcm;
+    sign = 0x80;
+  }
+  if (pcm > CLIP) pcm = CLIP;
+  pcm += BIAS;
+
+  int exponent = 7;
+  for (int exp_mask = 0x4000; (pcm & exp_mask) == 0 && exponent > 0; exponent--, exp_mask >>= 1) {}
+  int mantissa = (pcm >> (exponent + 3)) & 0x0F;
+  return static_cast<uint8_t>(~(sign | (exponent << 4) | mantissa));
+}
+
+uint8_t RTSPAudioComponent::linear_to_alaw_(int16_t sample) {
+  static const int16_t SEG_END[8] = {0x00FF, 0x01FF, 0x03FF, 0x07FF, 0x0FFF, 0x1FFF, 0x3FFF, 0x7FFF};
+  int pcm = sample;
+  int mask;
+  if (pcm >= 0) {
+    mask = 0xD5;
+  } else {
+    mask = 0x55;
+    pcm = -pcm - 1;
+  }
+  if (pcm > 32635) pcm = 32635;
+
+  int seg = 0;
+  while (seg < 8 && pcm > SEG_END[seg]) seg++;
+
+  uint8_t aval;
+  if (seg >= 8) {
+    aval = 0x7F;
+  } else if (seg == 0) {
+    aval = static_cast<uint8_t>(pcm >> 4);
+  } else {
+    aval = static_cast<uint8_t>((seg << 4) | ((pcm >> (seg + 3)) & 0x0F));
+  }
+  return static_cast<uint8_t>(aval ^ mask);
+}
+
 std::string RTSPAudioComponent::make_sdp_() const {
   char sdp[512];
   snprintf(sdp, sizeof(sdp),
@@ -275,9 +367,9 @@ std::string RTSPAudioComponent::make_sdp_() const {
            "c=IN IP4 %s\r\n"
            "t=0 0\r\n"
            "m=audio 0 RTP/AVP %d\r\n"
-           "a=rtpmap:%d L16/%d/1\r\n"
+           "a=rtpmap:%d %s/%d/1\r\n"
            "a=control:trackID=0\r\n",
-           this->local_ip_().c_str(), this->local_ip_().c_str(), this->rtp_payload_type_, this->rtp_payload_type_, this->sample_rate_);
+           this->local_ip_().c_str(), this->local_ip_().c_str(), this->rtp_payload_type_, this->rtp_payload_type_, this->rtpmap_name_(), this->output_sample_rate_);
   return std::string(sdp);
 }
 
@@ -395,13 +487,16 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd) {
 }
 
 void RTSPAudioComponent::rtp_task_() {
-  const int samples_per_packet = std::max(80, (this->sample_rate_ * this->packet_ms_) / 1000);
-  // MicrophoneSource always hands us 16-bit signed PCM (we requested it that
-  // way in setup()), so each sample is always 2 bytes here -- unlike the old
-  // direct-I2S version, there's no separate 16-bit-vs-32-bit-input branch.
-  std::vector<uint8_t> input(samples_per_packet * 2);
-  std::vector<uint8_t> packet(12 + samples_per_packet * 2);
-  ESP_LOGI(TAG, "RTP task started: %d samples/packet, %d ms packets", samples_per_packet, this->packet_ms_);
+  const int input_samples_per_packet = std::max(80, (this->sample_rate_ * this->packet_ms_) / 1000);
+  const int output_samples_per_packet = std::max(80, (this->output_sample_rate_ * this->packet_ms_) / 1000);
+  const size_t bytes_per_output_sample = (this->codec_ == AudioCodec::L16) ? 2U : 1U;
+
+  // MicrophoneSource always hands us 16-bit signed PCM (we requested it that way in setup()).
+  std::vector<uint8_t> input(input_samples_per_packet * 2);
+  std::vector<uint8_t> packet(12 + output_samples_per_packet * bytes_per_output_sample);
+  ESP_LOGI(TAG, "RTP task started: codec=%s input=%d Hz output=%d Hz, %d ms packets",
+           this->rtpmap_name_(), this->sample_rate_, this->output_sample_rate_, this->packet_ms_);
+
   while (this->running_) {
     if (!this->streaming_ || this->rtp_fd_ < 0 || this->client_rtp_addr_ == nullptr) {
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -425,9 +520,14 @@ void RTSPAudioComponent::rtp_task_() {
     }
     this->i2s_reads_++;
 
-    int samples = bytes_read / 2;
-    if (samples <= 0) continue;
-    if (samples > samples_per_packet) samples = samples_per_packet;
+    int input_samples = bytes_read / 2;
+    if (input_samples <= 0) continue;
+    if (input_samples > input_samples_per_packet) input_samples = input_samples_per_packet;
+
+    int output_samples = (int) (((int64_t) input_samples * this->output_sample_rate_) / this->sample_rate_);
+    if (output_samples <= 0) output_samples = 1;
+    if (output_samples > output_samples_per_packet) output_samples = output_samples_per_packet;
+
     int32_t min_sample = 32767;
     int32_t max_sample = -32768;
     int32_t peak_sample = 0;
@@ -445,32 +545,37 @@ void RTSPAudioComponent::rtp_task_() {
     packet[10] = (uint8_t) (this->ssrc_ >> 8);
     packet[11] = (uint8_t) (this->ssrc_ & 0xFF);
 
-    // Gain is now applied upstream by MicrophoneSource (gain_factor_), so this
-    // loop just repackages already-processed samples into RTP L16 instead of
-    // also shifting/scaling/clipping them itself. Peak/min/max are still
-    // tracked here (from the post-gain samples) since they're a useful debug
-    // signal regardless of where the gain was applied; a sample pinned at
-    // +/-32767 still means "something upstream clipped".
-    for (int i = 0; i < samples; i++) {
+    size_t payload_len = 0;
+    for (int out_i = 0; out_i < output_samples; out_i++) {
+      int in_i = (int) (((int64_t) out_i * this->sample_rate_) / this->output_sample_rate_);
+      if (in_i >= input_samples) in_i = input_samples - 1;
+
       int16_t v;
-      memcpy(&v, &input[i * 2], 2);
+      memcpy(&v, &input[in_i * 2], 2);
       if (v < min_sample) min_sample = v;
       if (v > max_sample) max_sample = v;
       int32_t abs_sample = v < 0 ? -(int32_t) v : (int32_t) v;
       if (abs_sample > peak_sample) peak_sample = abs_sample;
       if (abs_sample >= 32767) this->clipped_samples_++;
-      uint16_t be = htons((uint16_t) v);
-      memcpy(&packet[12 + i * 2], &be, 2);
+
+      if (this->codec_ == AudioCodec::PCMU) {
+        packet[12 + payload_len++] = linear_to_ulaw_(v);
+      } else if (this->codec_ == AudioCodec::PCMA) {
+        packet[12 + payload_len++] = linear_to_alaw_(v);
+      } else {
+        uint16_t be = htons((uint16_t) v);
+        memcpy(&packet[12 + payload_len], &be, 2);
+        payload_len += 2;
+      }
     }
+
     this->last_min_ = min_sample;
     this->last_max_ = max_sample;
     this->last_peak_ = peak_sample;
 
-    int sent = sendto(this->rtp_fd_, packet.data(), 12 + samples * 2, 0, (::sockaddr *) this->client_rtp_addr_, sizeof(::sockaddr_in));
+    int sent = sendto(this->rtp_fd_, packet.data(), 12 + payload_len, 0, (::sockaddr *) this->client_rtp_addr_, sizeof(::sockaddr_in));
     if (sent < 0) {
       this->rtp_send_errors_++;
-      // Do not pause for 100 ms on ENOBUFS/backpressure; that creates audible gaps.
-      // Throttle the warning so logging itself does not make audio worse.
       uint32_t t = now_ms();
       if (t - this->last_send_error_log_ms_ > 2000) {
         this->last_send_error_log_ms_ = t;
@@ -481,7 +586,7 @@ void RTSPAudioComponent::rtp_task_() {
     }
     this->rtp_packets_++;
     this->rtp_sequence_++;
-    this->rtp_timestamp_ += samples;
+    this->rtp_timestamp_ += output_samples;
   }
   ESP_LOGI(TAG, "RTP task stopped");
 }
@@ -541,22 +646,23 @@ void RTSPAudioComponent::loop() {
 void RTSPAudioComponent::log_status_(const char *reason) {
   ESP_LOGI(TAG,
            "RTSP native status [%s]: started=%s mic_running=%s client=%s streaming=%s ip=%s port=%d free_heap=%u "
-           "packets=%u send_err=%u clip=%u reads=%u empty=%u drop=%u bytes=%u peak=%d min=%d max=%d last_error=%s",
+           "codec=%s/%d packets=%u send_err=%u clip=%u reads=%u empty=%u drop=%u bytes=%u peak=%d min=%d max=%d last_error=%s",
            reason, YESNO(this->started_.load()),
            YESNO(this->mic_source_ != nullptr && this->mic_source_->is_running()), YESNO(this->client_connected_.load()),
            YESNO(this->streaming_.load()), this->local_ip_().c_str(), this->port_, (unsigned) esp_get_free_heap_size(),
-           (unsigned) this->rtp_packets_.load(), (unsigned) this->rtp_send_errors_.load(),
+           this->rtpmap_name_(), this->output_sample_rate_, (unsigned) this->rtp_packets_.load(), (unsigned) this->rtp_send_errors_.load(),
            (unsigned) this->clipped_samples_.load(), (unsigned) this->i2s_reads_.load(), (unsigned) this->i2s_empty_reads_.load(), (unsigned) this->dropped_bytes_.load(), (unsigned) this->last_bytes_read_.load(),
            (int) this->last_peak_.load(), (int) this->last_min_.load(), (int) this->last_max_.load(), this->last_error_.c_str());
 }
 
 void RTSPAudioComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Native RTSP Audio (microphone-source) v2");
+  ESP_LOGCONFIG(TAG, "Native RTSP Audio (microphone-source) v4-codecs");
   ESP_LOGCONFIG(TAG, "  Port: %d", this->port_);
   ESP_LOGCONFIG(TAG, "  Microphone sample rate: %d Hz", this->sample_rate_);
+  ESP_LOGCONFIG(TAG, "  Encoder codec: %s", this->codec_name_());
+  ESP_LOGCONFIG(TAG, "  RTP output: %s/%d/1 payload_type=%d", this->rtpmap_name_(), this->output_sample_rate_, this->rtp_payload_type_);
   ESP_LOGCONFIG(TAG, "  Microphone channel index: %u", (unsigned) this->channel_);
   ESP_LOGCONFIG(TAG, "  Gain factor: %d", (int) this->gain_factor_);
-  ESP_LOGCONFIG(TAG, "  RTP codec: L16/%d/1 payload_type=%d", this->sample_rate_, this->rtp_payload_type_);
   ESP_LOGCONFIG(TAG, "  Packet duration: %d ms", this->packet_ms_);
   ESP_LOGCONFIG(TAG, "  Audio buffer: %d ms", this->buffer_ms_);
   ESP_LOGCONFIG(TAG, "  Authentication: %s", YESNO(this->auth_enabled_));

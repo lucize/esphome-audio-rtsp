@@ -16,6 +16,8 @@ CONF_CHANNEL = "channel"  # backward-compatible alias for output channel index
 CONF_AUDIO_CHANNEL = "audio_channel"
 CONF_GAIN_FACTOR = "gain_factor"
 CONF_RTP_PAYLOAD_TYPE = "rtp_payload_type"
+CONF_CODEC = "codec"
+CONF_OUTPUT_SAMPLE_RATE = "output_sample_rate"
 CONF_PACKET_MS = "packet_ms"
 CONF_DEBUG = "debug"
 CONF_STATUS_INTERVAL = "status_interval"
@@ -49,7 +51,22 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_CHANNEL): cv.int_range(min=0, max=7),
             # Integer gain applied by ESPHome MicrophoneSource before RTP packetization.
             cv.Optional(CONF_GAIN_FACTOR, default=4): cv.int_range(min=1, max=64),
-            cv.Optional(CONF_RTP_PAYLOAD_TYPE, default=96): cv.int_range(min=96, max=127),
+            cv.Optional(CONF_CODEC, default="l16"): cv.enum({
+                "l16": "l16",
+                "pcm": "l16",
+                "pcmu": "pcmu",
+                "ulaw": "pcmu",
+                "mulaw": "pcmu",
+                "g711u": "pcmu",
+                "g711_ulaw": "pcmu",
+                "pcma": "pcma",
+                "alaw": "pcma",
+                "g711a": "pcma",
+                "g711_alaw": "pcma",
+            }, lower=True),
+            cv.Optional(CONF_OUTPUT_SAMPLE_RATE): cv.int_range(min=8000, max=48000),
+            # Optional override. Defaults are codec-aware: L16=96, PCMU=0, PCMA=8.
+            cv.Optional(CONF_RTP_PAYLOAD_TYPE): cv.int_range(min=0, max=127),
             cv.Optional(CONF_PACKET_MS, default=20): cv.int_range(min=10, max=100),
             cv.Optional(CONF_BUFFER_MS, default=200): cv.int_range(min=60, max=2000),
             cv.Optional(CONF_DEBUG, default=False): cv.boolean,
@@ -85,7 +102,10 @@ async def to_code(config):
     cg.add(var.set_port(config[CONF_PORT]))
     cg.add(var.set_channel(audio_channel))
     cg.add(var.set_gain_factor(config[CONF_GAIN_FACTOR]))
-    cg.add(var.set_rtp_config(config[CONF_RTP_PAYLOAD_TYPE], config[CONF_PACKET_MS]))
+    cg.add(var.set_codec(config[CONF_CODEC]))
+    cg.add(var.set_rtp_config(config.get(CONF_RTP_PAYLOAD_TYPE, -1), config[CONF_PACKET_MS]))
+    if CONF_OUTPUT_SAMPLE_RATE in config:
+        cg.add(var.set_output_sample_rate(config[CONF_OUTPUT_SAMPLE_RATE]))
     cg.add(var.set_buffer_ms(config[CONF_BUFFER_MS]))
     cg.add(var.set_debug(config[CONF_DEBUG]))
     cg.add(var.set_status_interval(config[CONF_STATUS_INTERVAL].total_milliseconds))

@@ -18,14 +18,33 @@
 namespace esphome {
 namespace rtsp_audio {
 
+enum class AudioCodec : uint8_t {
+  L16 = 0,
+  PCMU = 1,
+  PCMA = 2,
+};
+
 class RTSPAudioComponent : public Component {
  public:
   void set_microphone(microphone::Microphone *mic) { this->mic_ = mic; }
   void set_port(int port) { this->port_ = port; }
   void set_channel(uint8_t channel) { this->channel_ = channel; }
   void set_gain_factor(int32_t gain_factor) { this->gain_factor_ = gain_factor; }
+  void set_codec(const std::string &codec) {
+    if (codec == "pcmu") {
+      this->codec_ = AudioCodec::PCMU;
+    } else if (codec == "pcma") {
+      this->codec_ = AudioCodec::PCMA;
+    } else {
+      this->codec_ = AudioCodec::L16;
+    }
+  }
+  void set_output_sample_rate(int sample_rate) { this->output_sample_rate_config_ = sample_rate; }
   void set_rtp_config(int payload_type, int packet_ms) {
-    this->rtp_payload_type_ = payload_type;
+    if (payload_type >= 0) {
+      this->rtp_payload_type_ = payload_type;
+      this->rtp_payload_type_user_set_ = true;
+    }
     this->packet_ms_ = packet_ms;
   }
   void set_debug(bool debug) { this->debug_ = debug; }
@@ -62,6 +81,11 @@ class RTSPAudioComponent : public Component {
   int parse_cseq_(const std::string &request) const;
   bool parse_client_ports_(const std::string &request, int *rtp_port, int *rtcp_port) const;
   std::string make_sdp_() const;
+  void configure_codec_();
+  const char *codec_name_() const;
+  const char *rtpmap_name_() const;
+  static uint8_t linear_to_ulaw_(int16_t sample);
+  static uint8_t linear_to_alaw_(int16_t sample);
   bool request_authorized_(const std::string &request) const;
   void send_auth_required_(int fd, int cseq);
   static std::string base64_encode_(const std::string &input);
@@ -75,7 +99,11 @@ class RTSPAudioComponent : public Component {
 
   int port_{8554};
   int sample_rate_{16000};  // populated from the microphone at setup() time
+  int output_sample_rate_{16000};
+  int output_sample_rate_config_{0};
+  AudioCodec codec_{AudioCodec::L16};
   int rtp_payload_type_{96};
+  bool rtp_payload_type_user_set_{false};
   int packet_ms_{20};
   int buffer_ms_{200};
   bool debug_{false};
