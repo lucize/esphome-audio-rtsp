@@ -5,6 +5,7 @@ esphome:
 external_components:
   - source: github://lucize/esphome-audio-rtsp@main
     components: [rtsp_audio]
+    refresh: 0s
 
 esp32:
   board: esp32dev
@@ -33,26 +34,29 @@ wifi:
 
 captive_portal:
 
+i2s_audio:
+  - id: i2s_in
+    i2s_lrclk_pin: GPIO25   # INMP441 WS / LRCLK
+    i2s_bclk_pin: GPIO26    # INMP441 SCK / BCLK
+
+microphone:
+  - platform: i2s_audio
+    id: inmp441_mic
+    i2s_audio_id: i2s_in
+    i2s_din_pin: GPIO27     # INMP441 SD / DOUT
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: left           # INMP441 L/R wiring; try right if silent
+
 rtsp_audio:
-  bclk_pin: GPIO26
-  lrclk_pin: GPIO25
-  din_pin: GPIO27
-
-  adc_type: external
-  pdm: false
-
+  microphone: inmp441_mic
   port: 8554
-  sample_rate: 16000
-  bits_per_sample: 32bit
-  channel: left
-
-  i2s_port: 0
-  use_stereo_slot: false
-  sample_shift: 14
-  gain: 4.0
-  use_apll: false
-
+  audio_channel: 0          # microphone output channel index; mono mic = 0
+  gain_factor: 4            # 1-64 integer gain applied before RTP packetization
   rtp_payload_type: 96
   packet_ms: 20
+  buffer_ms: 200
   debug: true
   status_interval: 10s

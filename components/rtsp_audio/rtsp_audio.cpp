@@ -12,6 +12,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
+#include "lwip/tcp.h"
 
 namespace esphome {
 namespace rtsp_audio {
@@ -39,84 +40,58 @@ static std::string header_value(const std::string &request, const char *name) {
 void RTSPAudioComponent::setup() {
   this->setup_attempts_++;
   this->running_ = true;
-  ESP_LOGI(TAG, "Native ESP-IDF RTSP audio setup attempt %u", this->setup_attempts_);
+  ESP_LOGI(TAG, "Native RTSP audio (microphone-source) setup attempt %u", this->setup_attempts_);
 
-  if (!this->start_i2s_()) {
-    ESP_LOGE(TAG, "I2S startup failed: %s", this->last_error_.c_str());
+  if (this->mic_ == nullptr) {
+    this->last_error_ = "no microphone: entity configured";
+    ESP_LOGE(TAG, "%s", this->last_error_.c_str());
     return;
   }
+
+  // Always request 16-bit from MicrophoneSource: that's exactly what RTP L16
+  // needs, and it means MicrophoneSource does the 24/32-bit -> 16-bit
+  // conversion for us instead of us hand-rolling a bit-shift (which is what
+  // the old direct-I2S version of this component had to do itself).
+  this->mic_source_ = new microphone::MicrophoneSource(this->mic_, /*bits_per_sample=*/16, this->gain_factor_,
+                                                         /*passive=*/false);
+  this->mic_source_->add_channel(this->channel_);
+
+  audio::AudioStreamInfo info = this->mic_source_->get_audio_stream_info();
+  this->sample_rate_ = info.get_sample_rate();
+
+  // Small buffer between the microphone callback and RTP sender. Keeping this
+  // low avoids building up noticeable latency; the trigger level is one RTP
+  // packet so the sender wakes for whole packets instead of tiny partial chunks.
+  const size_t packet_bytes = std::max<size_t>(160, ((size_t) this->sample_rate_ * (size_t) this->packet_ms_ / 1000U) * 2U);
+  size_t buffer_bytes = ((size_t) this->sample_rate_ * (size_t) this->buffer_ms_ / 1000U) * 2U;
+  if (buffer_bytes < packet_bytes * 3U) buffer_bytes = packet_bytes * 3U;
+  if (buffer_bytes < 4096) buffer_bytes = 4096;
+  this->audio_buffer_ = xStreamBufferCreate(buffer_bytes, packet_bytes);
+  if (this->audio_buffer_ == nullptr) {
+    this->last_error_ = "failed to allocate audio stream buffer";
+    ESP_LOGE(TAG, "%s", this->last_error_.c_str());
+    return;
+  }
+
+  this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
+    if (this->audio_buffer_ != nullptr) {
+      // Zero timeout: never block the microphone's own task. If the RTP
+      // sender has fallen behind and the buffer is full, this just sends as
+      // many bytes as currently fit and silently drops the rest.
+      size_t written = xStreamBufferSend(this->audio_buffer_, data.data(), data.size(), 0);
+      if (written < data.size()) this->dropped_bytes_ += (uint32_t) (data.size() - written);
+    }
+  });
+
   if (!this->start_server_task_()) {
     ESP_LOGE(TAG, "RTSP server startup failed: %s", this->last_error_.c_str());
     return;
   }
   this->started_ = true;
   this->last_error_ = "none";
-  ESP_LOGI(TAG, "Native RTSP audio server task started on port %d", this->port_);
+  ESP_LOGI(TAG, "Native RTSP audio server task started on port %d (microphone: %u Hz)", this->port_,
+           (unsigned) this->sample_rate_);
   ESP_LOGI(TAG, "RTSP URL: rtsp://%s:%d/", this->local_ip_().c_str(), this->port_);
-}
-
-bool RTSPAudioComponent::start_i2s_() {
-  if (this->i2s_started_) return true;
-
-  i2s_port_t port = (this->i2s_port_num_ == 1) ? I2S_NUM_1 : I2S_NUM_0;
-
-  i2s_data_bit_width_t bits = I2S_DATA_BIT_WIDTH_32BIT;
-  if (this->i2s_bits_per_sample_ == 16) bits = I2S_DATA_BIT_WIDTH_16BIT;
-#if defined(I2S_DATA_BIT_WIDTH_24BIT)
-  if (this->i2s_bits_per_sample_ == 24) bits = I2S_DATA_BIT_WIDTH_24BIT;
-#endif
-
-  ESP_LOGI(TAG, "Starting ESP-IDF I2S STD: port=%d bclk=GPIO%d lrclk=GPIO%d din=GPIO%d rate=%d i2s_bits=%d channel=%s shift=%d gain=%.2fx apll=%s",
-           this->i2s_port_num_, this->bclk_pin_, this->lrclk_pin_, this->din_pin_, this->sample_rate_,
-           this->i2s_bits_per_sample_, this->right_channel_ ? "right" : "left", this->sample_shift_, this->gain_, YESNO(this->use_apll_));
-
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(port, I2S_ROLE_MASTER);
-  chan_cfg.dma_desc_num = 8;
-  chan_cfg.dma_frame_num = 256;
-
-  esp_err_t err = i2s_new_channel(&chan_cfg, nullptr, &this->rx_chan_);
-  if (err != ESP_OK) {
-    this->last_error_ = std::string("i2s_new_channel failed: ") + esp_err_to_name(err);
-    this->rx_chan_ = nullptr;
-    return false;
-  }
-
-  i2s_std_config_t std_cfg = {};
-  std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(static_cast<uint32_t>(this->sample_rate_));
-#if defined(I2S_CLK_SRC_APLL)
-  if (this->use_apll_) {
-    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
-  }
-#endif
-  std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(bits, this->use_stereo_slot_ ? I2S_SLOT_MODE_STEREO : I2S_SLOT_MODE_MONO);
-  std_cfg.slot_cfg.slot_mask = this->right_channel_ ? I2S_STD_SLOT_RIGHT : I2S_STD_SLOT_LEFT;
-  std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-  std_cfg.gpio_cfg.bclk = static_cast<gpio_num_t>(this->bclk_pin_);
-  std_cfg.gpio_cfg.ws = static_cast<gpio_num_t>(this->lrclk_pin_);
-  std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
-  std_cfg.gpio_cfg.din = static_cast<gpio_num_t>(this->din_pin_);
-  std_cfg.gpio_cfg.invert_flags.mclk_inv = false;
-  std_cfg.gpio_cfg.invert_flags.bclk_inv = false;
-  std_cfg.gpio_cfg.invert_flags.ws_inv = false;
-
-  err = i2s_channel_init_std_mode(this->rx_chan_, &std_cfg);
-  if (err != ESP_OK) {
-    this->last_error_ = std::string("i2s_channel_init_std_mode failed: ") + esp_err_to_name(err);
-    i2s_del_channel(this->rx_chan_);
-    this->rx_chan_ = nullptr;
-    return false;
-  }
-
-  err = i2s_channel_enable(this->rx_chan_);
-  if (err != ESP_OK) {
-    this->last_error_ = std::string("i2s_channel_enable failed: ") + esp_err_to_name(err);
-    i2s_del_channel(this->rx_chan_);
-    this->rx_chan_ = nullptr;
-    return false;
-  }
-
-  this->i2s_started_ = true;
-  return true;
 }
 
 bool RTSPAudioComponent::start_server_task_() {
@@ -190,6 +165,8 @@ void RTSPAudioComponent::server_task_() {
       }
       char peer_ip[INET_ADDRSTRLEN] = {0};
       inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
+      int nodelay = 1;
+      setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
       ESP_LOGI(TAG, "RTSP client connected from %s:%u", peer_ip, ntohs(peer.sin_port));
       this->client_fd_ = cfd;
       this->client_connected_ = true;
@@ -343,6 +320,7 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd) {
         this->send_rtsp_response_(client_fd, 454, "Session Not Found", cseq, "", "");
         continue;
       }
+      if (this->audio_buffer_ != nullptr) xStreamBufferReset(this->audio_buffer_);
       this->streaming_ = true;
       if (this->rtp_task_handle_ == nullptr) {
         xTaskCreatePinnedToCore(&RTSPAudioComponent::rtp_task_trampoline_, "rtsp_audio_rtp", 8192, this, 6,
@@ -363,8 +341,10 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd) {
 
 void RTSPAudioComponent::rtp_task_() {
   const int samples_per_packet = std::max(80, (this->sample_rate_ * this->packet_ms_) / 1000);
-  const int input_bytes_per_sample = this->i2s_bits_per_sample_ <= 16 ? 2 : 4;
-  std::vector<uint8_t> input(samples_per_packet * input_bytes_per_sample);
+  // MicrophoneSource always hands us 16-bit signed PCM (we requested it that
+  // way in setup()), so each sample is always 2 bytes here -- unlike the old
+  // direct-I2S version, there's no separate 16-bit-vs-32-bit-input branch.
+  std::vector<uint8_t> input(samples_per_packet * 2);
   std::vector<uint8_t> packet(12 + samples_per_packet * 2);
   ESP_LOGI(TAG, "RTP task started: %d samples/packet, %d ms packets", samples_per_packet, this->packet_ms_);
   while (this->running_) {
@@ -374,16 +354,23 @@ void RTSPAudioComponent::rtp_task_() {
     }
 
     size_t bytes_read = 0;
-    esp_err_t err = this->rx_chan_ == nullptr ? ESP_ERR_INVALID_STATE : i2s_channel_read(this->rx_chan_, input.data(), input.size(), &bytes_read, 1000);
+    if (this->audio_buffer_ != nullptr) {
+      const uint32_t deadline = now_ms() + (uint32_t) std::max(50, this->packet_ms_ * 4);
+      while (bytes_read < input.size() && this->running_ && this->streaming_) {
+        TickType_t wait_ticks = bytes_read == 0 ? pdMS_TO_TICKS(std::max(50, this->packet_ms_ * 4)) : pdMS_TO_TICKS(2);
+        size_t n = xStreamBufferReceive(this->audio_buffer_, input.data() + bytes_read, input.size() - bytes_read, wait_ticks);
+        bytes_read += n;
+        if (n == 0 || now_ms() >= deadline) break;
+      }
+    }
     this->last_bytes_read_ = (uint32_t) bytes_read;
-    if (err != ESP_OK || bytes_read == 0) {
+    if (bytes_read == 0) {
       this->i2s_empty_reads_++;
-      if (this->debug_) ESP_LOGW(TAG, "i2s_read failed/empty: %s bytes=%u", esp_err_to_name(err), (unsigned) bytes_read);
       continue;
     }
     this->i2s_reads_++;
 
-    int samples = bytes_read / input_bytes_per_sample;
+    int samples = bytes_read / 2;
     if (samples <= 0) continue;
     if (samples > samples_per_packet) samples = samples_per_packet;
     int32_t min_sample = 32767;
@@ -403,25 +390,21 @@ void RTSPAudioComponent::rtp_task_() {
     packet[10] = (uint8_t) (this->ssrc_ >> 8);
     packet[11] = (uint8_t) (this->ssrc_ & 0xFF);
 
+    // Gain is now applied upstream by MicrophoneSource (gain_factor_), so this
+    // loop just repackages already-processed samples into RTP L16 instead of
+    // also shifting/scaling/clipping them itself. Peak/min/max are still
+    // tracked here (from the post-gain samples) since they're a useful debug
+    // signal regardless of where the gain was applied; a sample pinned at
+    // +/-32767 still means "something upstream clipped".
     for (int i = 0; i < samples; i++) {
-      int32_t raw = 0;
-      if (input_bytes_per_sample == 2) {
-        int16_t v;
-        memcpy(&v, &input[i * 2], 2);
-        raw = v;
-      } else {
-        int32_t v;
-        memcpy(&v, &input[i * 4], 4);
-        raw = v >> this->sample_shift_;
-      }
-      int32_t amplified = (int32_t) lrintf((float) raw * this->gain_);
-      if (amplified > 32767) { amplified = 32767; this->clipped_samples_++; }
-      if (amplified < -32768) { amplified = -32768; this->clipped_samples_++; }
-      if (amplified < min_sample) min_sample = amplified;
-      if (amplified > max_sample) max_sample = amplified;
-      int32_t abs_sample = amplified < 0 ? -amplified : amplified;
+      int16_t v;
+      memcpy(&v, &input[i * 2], 2);
+      if (v < min_sample) min_sample = v;
+      if (v > max_sample) max_sample = v;
+      int32_t abs_sample = v < 0 ? -(int32_t) v : (int32_t) v;
       if (abs_sample > peak_sample) peak_sample = abs_sample;
-      uint16_t be = htons((uint16_t) ((int16_t) amplified));
+      if (abs_sample >= 32767) this->clipped_samples_++;
+      uint16_t be = htons((uint16_t) v);
       memcpy(&packet[12 + i * 2], &be, 2);
     }
     this->last_min_ = min_sample;
@@ -476,6 +459,24 @@ std::string RTSPAudioComponent::local_ip_() const {
 
 void RTSPAudioComponent::loop() {
   uint32_t now = now_ms();
+
+  // Only run the microphone while an RTSP client is actually in PLAY state,
+  // so an idle server doesn't keep the mic (and whatever it owns) running for
+  // nothing. mic_source_->start()/stop() are only ever called from here (the
+  // main ESPHome loop task), never from the RTSP/RTP tasks directly -- the
+  // RTSP task just flips the streaming_ atomic and this polls it.
+  if (this->mic_source_ != nullptr) {
+    bool want_running = this->streaming_.load();
+    bool mic_running = this->mic_source_->is_running();
+    if (want_running && !mic_running) {
+      ESP_LOGD(TAG, "RTSP playback active, starting microphone capture.");
+      this->mic_source_->start();
+    } else if (!want_running && mic_running) {
+      ESP_LOGD(TAG, "RTSP playback stopped, stopping microphone capture.");
+      this->mic_source_->stop();
+    }
+  }
+
   if (this->debug_ && this->status_interval_ms_ > 0 && now - this->last_status_ms_ >= this->status_interval_ms_) {
     this->last_status_ms_ = now;
     this->log_status_("periodic");
@@ -484,36 +485,30 @@ void RTSPAudioComponent::loop() {
 
 void RTSPAudioComponent::log_status_(const char *reason) {
   ESP_LOGI(TAG,
-           "RTSP native status [%s]: started=%s i2s=%s client=%s streaming=%s ip=%s port=%d free_heap=%u "
-           "packets=%u send_err=%u clip=%u i2s_reads=%u empty=%u bytes=%u peak=%d min=%d max=%d last_error=%s",
-           reason, YESNO(this->started_.load()), YESNO(this->i2s_started_.load()), YESNO(this->client_connected_.load()),
+           "RTSP native status [%s]: started=%s mic_running=%s client=%s streaming=%s ip=%s port=%d free_heap=%u "
+           "packets=%u send_err=%u clip=%u reads=%u empty=%u drop=%u bytes=%u peak=%d min=%d max=%d last_error=%s",
+           reason, YESNO(this->started_.load()),
+           YESNO(this->mic_source_ != nullptr && this->mic_source_->is_running()), YESNO(this->client_connected_.load()),
            YESNO(this->streaming_.load()), this->local_ip_().c_str(), this->port_, (unsigned) esp_get_free_heap_size(),
            (unsigned) this->rtp_packets_.load(), (unsigned) this->rtp_send_errors_.load(),
-           (unsigned) this->clipped_samples_.load(), (unsigned) this->i2s_reads_.load(), (unsigned) this->i2s_empty_reads_.load(), (unsigned) this->last_bytes_read_.load(),
+           (unsigned) this->clipped_samples_.load(), (unsigned) this->i2s_reads_.load(), (unsigned) this->i2s_empty_reads_.load(), (unsigned) this->dropped_bytes_.load(), (unsigned) this->last_bytes_read_.load(),
            (int) this->last_peak_.load(), (int) this->last_min_.load(), (int) this->last_max_.load(), this->last_error_.c_str());
 }
 
 void RTSPAudioComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Native ESP-IDF RTSP Audio v9");
+  ESP_LOGCONFIG(TAG, "Native RTSP Audio (microphone-source) v2");
   ESP_LOGCONFIG(TAG, "  Port: %d", this->port_);
-  ESP_LOGCONFIG(TAG, "  BCLK pin: GPIO%d", this->bclk_pin_);
-  ESP_LOGCONFIG(TAG, "  LRCLK/WS pin: GPIO%d", this->lrclk_pin_);
-  ESP_LOGCONFIG(TAG, "  DIN/SD pin: GPIO%d", this->din_pin_);
-  ESP_LOGCONFIG(TAG, "  Sample rate: %d", this->sample_rate_);
+  ESP_LOGCONFIG(TAG, "  Microphone sample rate: %d Hz", this->sample_rate_);
+  ESP_LOGCONFIG(TAG, "  Microphone channel index: %u", (unsigned) this->channel_);
+  ESP_LOGCONFIG(TAG, "  Gain factor: %d", (int) this->gain_factor_);
   ESP_LOGCONFIG(TAG, "  RTP codec: L16/%d/1 payload_type=%d", this->sample_rate_, this->rtp_payload_type_);
-  ESP_LOGCONFIG(TAG, "  I2S port: %d", this->i2s_port_num_);
-  ESP_LOGCONFIG(TAG, "  I2S bits/sample: %d", this->i2s_bits_per_sample_);
-  ESP_LOGCONFIG(TAG, "  Channel: %s", this->right_channel_ ? "right" : "left");
-  ESP_LOGCONFIG(TAG, "  Sample shift: %d", this->sample_shift_);
-  ESP_LOGCONFIG(TAG, "  Gain: %.2fx", this->gain_);
-  ESP_LOGCONFIG(TAG, "  APLL: %s", YESNO(this->use_apll_));
-  ESP_LOGCONFIG(TAG, "  I2S slot mode: %s", this->use_stereo_slot_ ? "stereo clocks / selected slot" : "mono");
   ESP_LOGCONFIG(TAG, "  Packet duration: %d ms", this->packet_ms_);
+  ESP_LOGCONFIG(TAG, "  Audio buffer: %d ms", this->buffer_ms_);
   ESP_LOGCONFIG(TAG, "  Debug: %s", YESNO(this->debug_));
   ESP_LOGCONFIG(TAG, "  Status interval: %u ms", this->status_interval_ms_);
-  ESP_LOGCONFIG(TAG, "  Runtime started=%s i2s=%s client=%s streaming=%s ip=%s last_error=%s", YESNO(this->started_.load()),
-                YESNO(this->i2s_started_.load()), YESNO(this->client_connected_.load()), YESNO(this->streaming_.load()),
-                this->local_ip_().c_str(), this->last_error_.c_str());
+  ESP_LOGCONFIG(TAG, "  Runtime started=%s client=%s streaming=%s ip=%s last_error=%s", YESNO(this->started_.load()),
+                YESNO(this->client_connected_.load()), YESNO(this->streaming_.load()), this->local_ip_().c_str(),
+                this->last_error_.c_str());
 }
 
 void RTSPAudioComponent::stop_server_() {
@@ -535,11 +530,12 @@ void RTSPAudioComponent::stop_server_() {
 void RTSPAudioComponent::on_shutdown() {
   ESP_LOGI(TAG, "Shutting down native RTSP audio");
   this->stop_server_();
-  if (this->i2s_started_ && this->rx_chan_ != nullptr) {
-    i2s_channel_disable(this->rx_chan_);
-    i2s_del_channel(this->rx_chan_);
-    this->rx_chan_ = nullptr;
-    this->i2s_started_ = false;
+  if (this->mic_source_ != nullptr && this->mic_source_->is_running()) {
+    this->mic_source_->stop();
+  }
+  if (this->audio_buffer_ != nullptr) {
+    vStreamBufferDelete(this->audio_buffer_);
+    this->audio_buffer_ = nullptr;
   }
 }
 

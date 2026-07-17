@@ -2,15 +2,17 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
+#include "esphome/components/microphone/microphone.h"
+#include "esphome/components/microphone/microphone_source.h"
 
 #include <atomic>
 #include <cstdint>
 #include <string>
 
-#include "driver/i2s_std.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/stream_buffer.h"
 #include "lwip/sockets.h"
 
 namespace esphome {
@@ -18,31 +20,17 @@ namespace rtsp_audio {
 
 class RTSPAudioComponent : public Component {
  public:
-  void set_i2s_pins(int bclk_pin, int lrclk_pin, int din_pin) {
-    this->bclk_pin_ = bclk_pin;
-    this->lrclk_pin_ = lrclk_pin;
-    this->din_pin_ = din_pin;
-  }
-
+  void set_microphone(microphone::Microphone *mic) { this->mic_ = mic; }
   void set_port(int port) { this->port_ = port; }
-  void set_audio_config(int sample_rate, bool right_channel) {
-    this->sample_rate_ = sample_rate;
-    this->right_channel_ = right_channel;
-  }
-  void set_i2s_config(int i2s_port, int i2s_bits_per_sample, int sample_shift, bool use_apll) {
-    this->i2s_port_num_ = i2s_port;
-    this->i2s_bits_per_sample_ = i2s_bits_per_sample;
-    this->sample_shift_ = sample_shift;
-    this->use_apll_ = use_apll;
-  }
+  void set_channel(uint8_t channel) { this->channel_ = channel; }
+  void set_gain_factor(int32_t gain_factor) { this->gain_factor_ = gain_factor; }
   void set_rtp_config(int payload_type, int packet_ms) {
     this->rtp_payload_type_ = payload_type;
     this->packet_ms_ = packet_ms;
   }
-  void set_gain(float gain) { this->gain_ = gain; }
   void set_debug(bool debug) { this->debug_ = debug; }
+  void set_buffer_ms(int buffer_ms) { this->buffer_ms_ = buffer_ms; }
   void set_status_interval(uint32_t interval_ms) { this->status_interval_ms_ = interval_ms; }
-  void set_use_stereo_slot(bool use_stereo_slot) { this->use_stereo_slot_ = use_stereo_slot; }
 
   void setup() override;
   void loop() override;
@@ -51,7 +39,6 @@ class RTSPAudioComponent : public Component {
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
  protected:
-  bool start_i2s_();
   bool start_server_task_();
   void stop_server_();
   void log_status_(const char *reason);
@@ -71,27 +58,22 @@ class RTSPAudioComponent : public Component {
   std::string make_sdp_() const;
   void close_rtp_sockets_();
 
-  int bclk_pin_{-1};
-  int lrclk_pin_{-1};
-  int din_pin_{-1};
+  microphone::Microphone *mic_{nullptr};
+  microphone::MicrophoneSource *mic_source_{nullptr};
+  StreamBufferHandle_t audio_buffer_{nullptr};
+  uint8_t channel_{0};
+  int32_t gain_factor_{4};
+
   int port_{8554};
-  int sample_rate_{16000};
-  bool right_channel_{false};
-  int i2s_port_num_{0};
-  i2s_chan_handle_t rx_chan_{nullptr};
-  int i2s_bits_per_sample_{32};
-  int sample_shift_{14};
-  bool use_apll_{false};
-  bool use_stereo_slot_{false};
+  int sample_rate_{16000};  // populated from the microphone at setup() time
   int rtp_payload_type_{96};
   int packet_ms_{20};
-  float gain_{1.0f};
+  int buffer_ms_{200};
   bool debug_{false};
   uint32_t status_interval_ms_{10000};
 
   std::atomic<bool> running_{false};
   std::atomic<bool> started_{false};
-  std::atomic<bool> i2s_started_{false};
   std::atomic<bool> client_connected_{false};
   std::atomic<bool> streaming_{false};
 
@@ -116,6 +98,7 @@ class RTSPAudioComponent : public Component {
   std::atomic<uint32_t> clipped_samples_{0};
   std::atomic<uint32_t> i2s_reads_{0};
   std::atomic<uint32_t> i2s_empty_reads_{0};
+  std::atomic<uint32_t> dropped_bytes_{0};
   std::atomic<int32_t> last_peak_{0};
   std::atomic<int32_t> last_min_{0};
   std::atomic<int32_t> last_max_{0};
