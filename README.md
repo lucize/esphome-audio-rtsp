@@ -16,7 +16,10 @@ Supported today:
 - ESPHome `microphone:` input
 - RTSP control over TCP
 - RTP audio over UDP
-- L16 / signed 16-bit PCM / mono
+- Selectable RTP audio encoding:
+  - `l16` - signed 16-bit PCM, default, highest compatibility/quality
+  - `pcmu` - G.711 mu-law, RTP static payload type 0 by default
+  - `pcma` - G.711 A-law, RTP static payload type 8 by default
 - One active RTSP client at a time
 - Optional RTSP Basic authentication
 
@@ -24,9 +27,11 @@ Supported today:
 Not supported yet:
 
 - RTSP interleaved TCP RTP
+- RTSP Digest authentication
 - AAC/Opus encoding
 - Multiple simultaneous RTSP clients
-
+- Full resampling/filtering; G.711 uses simple nearest-sample downsampling when the microphone runs above the output rate
+  
 ## Runtime behavior and optimizations
 
 The component intentionally uses ESPHome's native `i2s_audio:` / `microphone:` stack instead of opening the I2S peripheral itself. The RTSP server starts at boot, but microphone capture is started only while an RTSP client is in `PLAY` state and stopped again when streaming ends.
@@ -49,6 +54,16 @@ buffer_ms: 200
 gain_factor: 4
 ```
 
+Recommended starting point for G.711:
+
+```yaml
+codec: pcmu          # or pcma
+output_sample_rate: 8000
+packet_ms: 20
+buffer_ms: 200
+gain_factor: 4
+```
+
 Lower `buffer_ms` can reduce latency but increases the chance of dropouts on weak Wi-Fi. Higher `buffer_ms` can smooth jitter but adds delay.
 
 ## Credits / inspiration
@@ -57,6 +72,10 @@ Inspired by Phil Schatzmann's Arduino Audio Tools RTSP example:
 
 - [Arduino Audio Tools](https://github.com/pschatzmann/arduino-audio-tools)
 - [communication-audiokit-rtsp.ino example](https://github.com/pschatzmann/arduino-audio-tools/blob/main/examples/examples-communication/rtsp/communication-audiokit-rtsp/communication-audiokit-rtsp.ino)
+
+G.711 support was added after reviewing ESP32 SIP/VoIP examples such as:
+
+- [ESP32-SIP-Voice](https://github.com/GeorgeBregman/ESP32-SIP-Voice)
 
 The first proof of concept used Arduino Audio Tools to validate the idea. This repository is a separate ESPHome / ESP-IDF implementation and does not use Arduino Audio Tools at runtime.
 
@@ -142,6 +161,10 @@ rtsp_audio:
   port: 8554
   audio_channel: 0          # microphone output channel index; mono mic = 0
   gain_factor: 4            # 1-64 integer gain
+  # Encoder. Use l16 for best quality, or pcmu/pcma for lower bandwidth.
+  codec: l16
+  # For codec: pcmu/pcma, uncomment this for standard G.711 RTP:
+  # output_sample_rate: 8000
   rtp_payload_type: 96
   packet_ms: 20
   buffer_ms: 200
@@ -153,6 +176,40 @@ rtsp_audio:
   password: !secret rtsp_password
   auth_realm: ESPHome RTSP Audio
 ```
+
+## G.711 example
+
+For lower bandwidth, use G.711 mu-law:
+
+```yaml
+rtsp_audio:
+  microphone: inmp441_mic
+  port: 8554
+  audio_channel: 0
+  codec: pcmu
+  output_sample_rate: 8000
+  gain_factor: 4
+  packet_ms: 20
+  buffer_ms: 200
+```
+
+Or A-law:
+
+```yaml
+rtsp_audio:
+  microphone: inmp441_mic
+  codec: pcma
+  output_sample_rate: 8000
+```
+
+Default RTP payload types are codec-aware:
+
+- `l16` -> dynamic payload type `96`
+- `pcmu` -> static payload type `0`
+- `pcma` -> static payload type `8`
+
+You can override this with `rtp_payload_type`, but the defaults are recommended.
+
 
 ## RTSP URL examples
 
@@ -194,8 +251,11 @@ ffplay rtsp://mic-front.local:8554/
 | `microphone` | yes | | ID of the ESPHome `microphone:` entity to stream. |
 | `port` | no | `8554` | RTSP TCP control port. |
 | `audio_channel` | no | `0` | Output channel index from the microphone source. For a mono INMP441 mic, use `0`. |
+| `channel` | no | | Backward-compatible alias for `audio_channel`. Prefer `audio_channel` in new configs. |
 | `gain_factor` | no | `4` | Integer microphone gain factor, 1-64. |
-| `rtp_payload_type` | no | `96` | Dynamic RTP payload type used for L16 audio. |
+| `codec` | no | `l16` | Encoder: `l16`, `pcmu`/`ulaw`, or `pcma`/`alaw`. |
+| `output_sample_rate` | no | codec-specific | Output RTP clock/sample rate. For G.711, default/recommended is `8000`. For L16, the microphone sample rate is used. |
+| `rtp_payload_type` | no | codec-specific | Optional RTP payload override. Defaults: L16=`96`, PCMU=`0`, PCMA=`8`. |
 | `packet_ms` | no | `20` | Audio per RTP packet, in milliseconds. |
 | `buffer_ms` | no | `200` | Microphone-to-RTP buffer size in milliseconds. Lower reduces latency; higher tolerates more jitter. |
 | `debug` | no | `false` | Enables periodic status/debug logging. |
@@ -203,6 +263,21 @@ ffplay rtsp://mic-front.local:8554/
 | `username` | no | | RTSP Basic auth username. Must be set together with `password`. |
 | `password` | no | | RTSP Basic auth password. Must be set together with `username`. |
 | `auth_realm` | no | `ESPHome RTSP Audio` | Realm shown in the RTSP `WWW-Authenticate` challenge. |
+
+## Authentication
+
+Authentication is optional. If `username` and `password` are omitted, the stream is open to anyone on the network who can reach the ESP32.
+
+If both are set, the server requires RTSP Basic authentication:
+
+```yaml
+rtsp_audio:
+  microphone: inmp441_mic
+  username: !secret rtsp_username
+  password: !secret rtsp_password
+```
+
+Basic authentication is not encrypted. Use it only on a trusted LAN/VPN or behind another secure proxy.
 
 ## Testing
 
@@ -228,19 +303,20 @@ RTSP-over-TCP interleaved transport is not implemented yet.
 
 ## Debugging
 
-With `debug: true`, the log includes:
+With `debug: true`, the log includes values like:
 
 ```text
-packets=... send_err=... clip=... i2s_reads=... empty=... bytes=... peak=... min=... max=...
+codec=PCMU/8000 packets=... send_err=... clip=... reads=... empty=... drop=... bytes=... peak=... min=... max=...
 ```
 
 Typical interpretation:
 
 - `streaming=YES`, `packets` increasing, `send_err=0`: RTSP/RTP is sending.
-- `clip` increasing quickly or `peak=32767`: gain/shift is too aggressive.
-- `packets` and `i2s_reads` increase but `peak=0 min=0 max=0`: try `channel: right` or check INMP441 L/R wiring.
+- `clip` increasing quickly or `peak=32767`: `gain_factor` is too aggressive.
+- `packets` and `reads` increase but `peak=0 min=0 max=0`: try `channel: right` in the ESPHome `microphone:` block or check INMP441 L/R wiring.
 - `send_err` increasing: UDP RTP packets are not leaving the ESP32 reliably; check Wi-Fi, VLAN/firewall, or client behavior.
-
+- `drop` increasing: RTP sender is falling behind; increase `buffer_ms`, reduce logging, or try `codec: pcmu`.
+  
 
 ## Notes for Frigate/go2rtc
 
