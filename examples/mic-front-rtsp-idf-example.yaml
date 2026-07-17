@@ -60,3 +60,8 @@ rtsp_audio:
   buffer_ms: 200
   debug: true
   status_interval: 10s
+
+  # Optional RTSP Basic authentication. Omit both to disable auth.
+  # username: !secret rtsp_username
+  # password: !secret rtsp_password
+  # auth_realm: ESPHome RTSP Audio

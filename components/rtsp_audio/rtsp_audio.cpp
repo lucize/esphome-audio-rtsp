@@ -1,9 +1,11 @@
 #include "rtsp_audio.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 #include "esp_err.h"
@@ -40,7 +42,12 @@ static std::string header_value(const std::string &request, const char *name) {
 void RTSPAudioComponent::setup() {
   this->setup_attempts_++;
   this->running_ = true;
-  ESP_LOGI(TAG, "Native RTSP audio (microphone-source) setup attempt %u", this->setup_attempts_);
+  ESP_LOGI(TAG, "Native RTSP audio (microphone-source) setup attempt %" PRIu32, this->setup_attempts_);
+
+  if (this->auth_enabled_) {
+    this->auth_token_ = base64_encode_(this->auth_username_ + ":" + this->auth_password_);
+    ESP_LOGI(TAG, "RTSP Basic authentication enabled (realm: %s)", this->auth_realm_.c_str());
+  }
 
   if (this->mic_ == nullptr) {
     this->last_error_ = "no microphone: entity configured";
@@ -217,6 +224,48 @@ bool RTSPAudioComponent::parse_client_ports_(const std::string &request, int *rt
   return true;
 }
 
+
+std::string RTSPAudioComponent::base64_encode_(const std::string &input) {
+  static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((input.size() + 2) / 3) * 4);
+
+  uint32_t val = 0;
+  int valb = -6;
+  for (uint8_t c : input) {
+    val = (val << 8) | c;
+    valb += 8;
+    while (valb >= 0) {
+      out.push_back(table[(val >> valb) & 0x3F]);
+      valb -= 6;
+    }
+  }
+  if (valb > -6) out.push_back(table[((val << 8) >> (valb + 8)) & 0x3F]);
+  while (out.size() % 4) out.push_back('=');
+  return out;
+}
+
+bool RTSPAudioComponent::request_authorized_(const std::string &request) const {
+  if (!this->auth_enabled_) return true;
+  std::string auth = header_value(request, "Authorization");
+  if (auth.empty()) return false;
+
+  const std::string prefix = "Basic ";
+  if (auth.size() < prefix.size()) return false;
+  if (auth.compare(0, prefix.size(), prefix) != 0) return false;
+
+  size_t pos = prefix.size();
+  while (pos < auth.size() && (auth[pos] == ' ' || auth[pos] == '\t')) pos++;
+  size_t end = auth.size();
+  while (end > pos && (auth[end - 1] == ' ' || auth[end - 1] == '\t' || auth[end - 1] == '\r' || auth[end - 1] == '\n')) end--;
+  return auth.substr(pos, end - pos) == this->auth_token_;
+}
+
+void RTSPAudioComponent::send_auth_required_(int fd, int cseq) {
+  std::string h = "WWW-Authenticate: Basic realm=\"" + this->auth_realm_ + "\"\r\n";
+  this->send_rtsp_response_(fd, 401, "Unauthorized", cseq, h, "");
+}
+
 std::string RTSPAudioComponent::make_sdp_() const {
   char sdp[512];
   snprintf(sdp, sizeof(sdp),
@@ -255,6 +304,12 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd) {
     std::string first = req.substr(0, req.find('\n'));
     if (!first.empty() && first.back() == '\r') first.pop_back();
     if (this->debug_) ESP_LOGI(TAG, "RTSP request: %s", first.c_str());
+
+    if (this->auth_enabled_ && req.rfind("OPTIONS", 0) != 0 && !this->request_authorized_(req)) {
+      if (this->debug_) ESP_LOGI(TAG, "RTSP request rejected: missing or invalid Basic auth");
+      this->send_auth_required_(client_fd, cseq);
+      continue;
+    }
 
     if (req.rfind("OPTIONS", 0) == 0) {
       this->send_rtsp_response_(client_fd, 200, "OK", cseq, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n", "");
@@ -504,8 +559,13 @@ void RTSPAudioComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  RTP codec: L16/%d/1 payload_type=%d", this->sample_rate_, this->rtp_payload_type_);
   ESP_LOGCONFIG(TAG, "  Packet duration: %d ms", this->packet_ms_);
   ESP_LOGCONFIG(TAG, "  Audio buffer: %d ms", this->buffer_ms_);
+  ESP_LOGCONFIG(TAG, "  Authentication: %s", YESNO(this->auth_enabled_));
+  if (this->auth_enabled_) {
+    ESP_LOGCONFIG(TAG, "  Auth realm: %s", this->auth_realm_.c_str());
+    ESP_LOGCONFIG(TAG, "  Auth username: %s", this->auth_username_.c_str());
+  }
   ESP_LOGCONFIG(TAG, "  Debug: %s", YESNO(this->debug_));
-  ESP_LOGCONFIG(TAG, "  Status interval: %u ms", this->status_interval_ms_);
+  ESP_LOGCONFIG(TAG, "  Status interval: %" PRIu32 " ms", this->status_interval_ms_);
   ESP_LOGCONFIG(TAG, "  Runtime started=%s client=%s streaming=%s ip=%s last_error=%s", YESNO(this->started_.load()),
                 YESNO(this->client_connected_.load()), YESNO(this->streaming_.load()), this->local_ip_().c_str(),
                 this->last_error_.c_str());

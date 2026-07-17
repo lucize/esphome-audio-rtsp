@@ -20,11 +20,18 @@ CONF_PACKET_MS = "packet_ms"
 CONF_DEBUG = "debug"
 CONF_STATUS_INTERVAL = "status_interval"
 CONF_BUFFER_MS = "buffer_ms"
+CONF_USERNAME = "username"
+CONF_PASSWORD = "password"
+CONF_AUTH_REALM = "auth_realm"
 
 
-def _validate_channel_aliases(config):
+def _validate_options(config):
     if CONF_CHANNEL in config and CONF_AUDIO_CHANNEL in config:
         raise cv.Invalid("Use only one of 'audio_channel' or 'channel' in rtsp_audio. Prefer 'audio_channel'.")
+    has_user = CONF_USERNAME in config
+    has_pass = CONF_PASSWORD in config
+    if has_user != has_pass:
+        raise cv.Invalid("Set both 'username' and 'password' to enable RTSP Basic authentication, or omit both.")
     return config
 
 
@@ -47,9 +54,12 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_BUFFER_MS, default=200): cv.int_range(min=60, max=2000),
             cv.Optional(CONF_DEBUG, default=False): cv.boolean,
             cv.Optional(CONF_STATUS_INTERVAL, default="10s"): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_USERNAME): cv.string_strict,
+            cv.Optional(CONF_PASSWORD): cv.string_strict,
+            cv.Optional(CONF_AUTH_REALM, default="ESPHome RTSP Audio"): cv.string_strict,
         }
     ).extend(cv.COMPONENT_SCHEMA),
-    _validate_channel_aliases,
+    _validate_options,
 )
 
 
@@ -79,3 +89,5 @@ async def to_code(config):
     cg.add(var.set_buffer_ms(config[CONF_BUFFER_MS]))
     cg.add(var.set_debug(config[CONF_DEBUG]))
     cg.add(var.set_status_interval(config[CONF_STATUS_INTERVAL].total_milliseconds))
+    if CONF_USERNAME in config:
+        cg.add(var.set_auth(config[CONF_USERNAME], config[CONF_PASSWORD], config[CONF_AUTH_REALM]))

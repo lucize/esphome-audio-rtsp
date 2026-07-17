@@ -31,6 +31,12 @@ class RTSPAudioComponent : public Component {
   void set_debug(bool debug) { this->debug_ = debug; }
   void set_buffer_ms(int buffer_ms) { this->buffer_ms_ = buffer_ms; }
   void set_status_interval(uint32_t interval_ms) { this->status_interval_ms_ = interval_ms; }
+  void set_auth(const std::string &username, const std::string &password, const std::string &realm) {
+    this->auth_username_ = username;
+    this->auth_password_ = password;
+    this->auth_realm_ = realm;
+    this->auth_enabled_ = !username.empty();
+  }
 
   void setup() override;
   void loop() override;
@@ -56,6 +62,9 @@ class RTSPAudioComponent : public Component {
   int parse_cseq_(const std::string &request) const;
   bool parse_client_ports_(const std::string &request, int *rtp_port, int *rtcp_port) const;
   std::string make_sdp_() const;
+  bool request_authorized_(const std::string &request) const;
+  void send_auth_required_(int fd, int cseq);
+  static std::string base64_encode_(const std::string &input);
   void close_rtp_sockets_();
 
   microphone::Microphone *mic_{nullptr};
@@ -71,6 +80,11 @@ class RTSPAudioComponent : public Component {
   int buffer_ms_{200};
   bool debug_{false};
   uint32_t status_interval_ms_{10000};
+  bool auth_enabled_{false};
+  std::string auth_username_;
+  std::string auth_password_;
+  std::string auth_realm_{"ESPHome RTSP Audio"};
+  std::string auth_token_;
 
   std::atomic<bool> running_{false};
   std::atomic<bool> started_{false};
