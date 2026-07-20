@@ -25,6 +25,7 @@ CONF_BUFFER_MS = "buffer_ms"
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_AUTH_REALM = "auth_realm"
+CONF_MAX_CLIENTS = "max_clients"
 
 
 def _validate_options(config):
@@ -69,6 +70,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_RTP_PAYLOAD_TYPE): cv.int_range(min=0, max=127),
             cv.Optional(CONF_PACKET_MS, default=20): cv.int_range(min=10, max=100),
             cv.Optional(CONF_BUFFER_MS, default=200): cv.int_range(min=60, max=2000),
+            cv.Optional(CONF_MAX_CLIENTS, default=2): cv.int_range(min=1, max=6),
             cv.Optional(CONF_DEBUG, default=False): cv.boolean,
             cv.Optional(CONF_STATUS_INTERVAL, default="10s"): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_USERNAME): cv.string_strict,
@@ -107,6 +109,7 @@ async def to_code(config):
     if CONF_OUTPUT_SAMPLE_RATE in config:
         cg.add(var.set_output_sample_rate(config[CONF_OUTPUT_SAMPLE_RATE]))
     cg.add(var.set_buffer_ms(config[CONF_BUFFER_MS]))
+    cg.add(var.set_max_clients(config[CONF_MAX_CLIENTS]))
     cg.add(var.set_debug(config[CONF_DEBUG]))
     cg.add(var.set_status_interval(config[CONF_STATUS_INTERVAL].total_milliseconds))
     if CONF_USERNAME in config:

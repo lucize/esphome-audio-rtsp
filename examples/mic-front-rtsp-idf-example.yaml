@@ -1,3 +1,4 @@
+# Example for esphome-audio-rtsp multiclient v6
 esphome:
   name: mic-front
   friendly_name: mic-front
@@ -53,7 +54,8 @@ microphone:
 rtsp_audio:
   microphone: inmp441_mic
   port: 8554
-  audio_channel: 0          # microphone output channel index; mono mic = 0
+  audio_channel: 0
+  max_clients: 6             # 1-6; encode once, send RTP to each PLAYing client
 
   # Encoder options:
   #   l16  = signed 16-bit PCM, best quality, highest bandwidth
@@ -63,7 +65,7 @@ rtsp_audio:
   # For codec: pcmu or pcma, uncomment this:
   # output_sample_rate: 8000
 
-  gain_factor: 4            # 1-64 integer gain applied before RTP packetization
+  gain_factor: 4
   packet_ms: 20
   buffer_ms: 200
   debug: true

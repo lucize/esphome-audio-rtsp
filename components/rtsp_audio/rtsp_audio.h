@@ -8,10 +8,12 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "lwip/sockets.h"
 
@@ -49,6 +51,7 @@ class RTSPAudioComponent : public Component {
   }
   void set_debug(bool debug) { this->debug_ = debug; }
   void set_buffer_ms(int buffer_ms) { this->buffer_ms_ = buffer_ms; }
+  void set_max_clients(int max_clients) { this->max_clients_ = max_clients < 1 ? 1 : (max_clients > 6 ? 6 : max_clients); }
   void set_status_interval(uint32_t interval_ms) { this->status_interval_ms_ = interval_ms; }
   void set_auth(const std::string &username, const std::string &password, const std::string &realm) {
     this->auth_username_ = username;
@@ -71,11 +74,17 @@ class RTSPAudioComponent : public Component {
 
   static void server_task_trampoline_(void *arg);
   static void rtp_task_trampoline_(void *arg);
+  static void client_task_trampoline_(void *arg);
   void server_task_();
   void rtp_task_();
 
   int create_tcp_server_();
-  void handle_rtsp_client_(int client_fd);
+  int allocate_client_session_(int fd);
+  void release_client_session_(int index);
+  int active_client_count_() const;
+  int active_stream_count_() const;
+  void update_streaming_state_();
+  void handle_rtsp_client_(int client_fd, int session_index);
   bool read_rtsp_request_(int fd, std::string &request);
   void send_rtsp_response_(int fd, int code, const char *reason, int cseq, const std::string &headers, const std::string &body);
   int parse_cseq_(const std::string &request) const;
@@ -89,7 +98,8 @@ class RTSPAudioComponent : public Component {
   bool request_authorized_(const std::string &request) const;
   void send_auth_required_(int fd, int cseq);
   static std::string base64_encode_(const std::string &input);
-  void close_rtp_sockets_();
+  void close_rtp_sockets_(int index);
+  void close_all_client_sessions_();
 
   microphone::Microphone *mic_{nullptr};
   microphone::MicrophoneSource *mic_source_{nullptr};
@@ -122,17 +132,31 @@ class RTSPAudioComponent : public Component {
   TaskHandle_t server_task_handle_{nullptr};
   TaskHandle_t rtp_task_handle_{nullptr};
   int server_fd_{-1};
-  int client_fd_{-1};
-  int rtp_fd_{-1};
-  int rtcp_fd_{-1};
-  int server_rtp_port_{0};
-  int server_rtcp_port_{0};
-  uint32_t ssrc_{0x45535048};
-  uint16_t rtp_sequence_{0};
-  uint32_t rtp_timestamp_{0};
+  struct ClientSession {
+    bool allocated{false};
+    bool playing{false};
+    int control_fd{-1};
+    int rtp_fd{-1};
+    int rtcp_fd{-1};
+    int server_rtp_port{0};
+    int server_rtcp_port{0};
+    uint32_t ssrc{0};
+    uint16_t rtp_sequence{0};
+    uint32_t rtp_timestamp{0};
+    std::string session_id;
+    ::sockaddr_in client_rtp_addr{};
+    ::sockaddr_in client_rtcp_addr{};
+  };
 
-  ::sockaddr_in *client_rtp_addr_{nullptr};
-  ::sockaddr_in *client_rtcp_addr_{nullptr};
+  struct ClientTaskArg {
+    RTSPAudioComponent *self;
+    int fd;
+    int session_index;
+  };
+
+  int max_clients_{2};
+  std::vector<ClientSession> sessions_;
+  SemaphoreHandle_t sessions_mutex_{nullptr};
 
   uint32_t setup_attempts_{0};
   std::atomic<uint32_t> rtp_packets_{0};

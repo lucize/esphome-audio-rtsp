@@ -42,7 +42,9 @@ static std::string header_value(const std::string &request, const char *name) {
 void RTSPAudioComponent::setup() {
   this->setup_attempts_++;
   this->running_ = true;
-  ESP_LOGI(TAG, "Native RTSP audio (microphone-source) setup attempt %" PRIu32, this->setup_attempts_);
+  this->sessions_mutex_ = xSemaphoreCreateMutex();
+  this->sessions_.resize(this->max_clients_);
+  ESP_LOGI(TAG, "Native RTSP audio (microphone-source, multiclient v6) setup attempt %" PRIu32, this->setup_attempts_);
 
   if (this->auth_enabled_) {
     this->auth_token_ = base64_encode_(this->auth_username_ + ":" + this->auth_password_);
@@ -127,6 +129,20 @@ void RTSPAudioComponent::rtp_task_trampoline_(void *arg) {
   vTaskDelete(nullptr);
 }
 
+void RTSPAudioComponent::client_task_trampoline_(void *arg) {
+  auto *task_arg = static_cast<RTSPAudioComponent::ClientTaskArg *>(arg);
+  auto *self = task_arg->self;
+  int fd = task_arg->fd;
+  int session_index = task_arg->session_index;
+  delete task_arg;
+
+  self->handle_rtsp_client_(fd, session_index);
+  self->release_client_session_(session_index);
+  close(fd);
+  ESP_LOGI(TAG, "RTSP client session %d disconnected", session_index);
+  vTaskDelete(nullptr);
+}
+
 int RTSPAudioComponent::create_tcp_server_() {
   int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
   if (fd < 0) {
@@ -145,7 +161,7 @@ int RTSPAudioComponent::create_tcp_server_() {
     close(fd);
     return -1;
   }
-  if (listen(fd, 1) < 0) {
+  if (listen(fd, this->max_clients_) < 0) {
     this->last_error_ = std::string("listen failed: ") + strerror(errno);
     close(fd);
     return -1;
@@ -161,7 +177,7 @@ void RTSPAudioComponent::server_task_() {
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
     }
-    ESP_LOGI(TAG, "RTSP TCP control listening on 0.0.0.0:%d", this->port_);
+    ESP_LOGI(TAG, "RTSP TCP control listening on 0.0.0.0:%d, max_clients=%d", this->port_, this->max_clients_);
 
     while (this->running_) {
       ::sockaddr_in peer = {};
@@ -175,21 +191,80 @@ void RTSPAudioComponent::server_task_() {
       inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
       int nodelay = 1;
       setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-      ESP_LOGI(TAG, "RTSP client connected from %s:%u", peer_ip, ntohs(peer.sin_port));
-      this->client_fd_ = cfd;
-      this->client_connected_ = true;
-      this->handle_rtsp_client_(cfd);
-      this->streaming_ = false;
-      this->client_connected_ = false;
-      this->client_fd_ = -1;
-      this->close_rtp_sockets_();
-      close(cfd);
-      ESP_LOGI(TAG, "RTSP client disconnected");
+
+      int session_index = this->allocate_client_session_(cfd);
+      if (session_index < 0) {
+        ESP_LOGW(TAG, "Rejecting RTSP client from %s:%u: max_clients=%d reached", peer_ip, ntohs(peer.sin_port), this->max_clients_);
+        this->send_rtsp_response_(cfd, 503, "Service Unavailable", 1, "Retry-After: 10\r\n", "");
+        close(cfd);
+        continue;
+      }
+
+      ESP_LOGI(TAG, "RTSP client session %d connected from %s:%u", session_index, peer_ip, ntohs(peer.sin_port));
+      auto *arg = new ClientTaskArg{this, cfd, session_index};
+      char task_name[20];
+      snprintf(task_name, sizeof(task_name), "rtsp_audio_c%d", session_index);
+      BaseType_t ok = xTaskCreatePinnedToCore(&RTSPAudioComponent::client_task_trampoline_, task_name, 8192, arg, 5, nullptr, 0);
+      if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create RTSP client task for session %d", session_index);
+        delete arg;
+        this->release_client_session_(session_index);
+        close(cfd);
+      }
     }
 
     close(this->server_fd_);
     this->server_fd_ = -1;
   }
+}
+
+int RTSPAudioComponent::allocate_client_session_(int fd) {
+  xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+  for (int i = 0; i < (int) this->sessions_.size(); i++) {
+    auto &s = this->sessions_[i];
+    if (!s.allocated) {
+      s = ClientSession{};
+      s.allocated = true;
+      s.control_fd = fd;
+      s.ssrc = 0x45535048u ^ ((uint32_t) esp_random()) ^ ((uint32_t) (i + 1) << 24);
+      s.rtp_sequence = (uint16_t) esp_random();
+      s.rtp_timestamp = esp_random();
+      char session_id[17];
+      snprintf(session_id, sizeof(session_id), "%08" PRIx32 "%02x", esp_random(), i & 0xFF);
+      s.session_id = session_id;
+      this->client_connected_ = true;
+      xSemaphoreGive(this->sessions_mutex_);
+      return i;
+    }
+  }
+  xSemaphoreGive(this->sessions_mutex_);
+  return -1;
+}
+
+void RTSPAudioComponent::release_client_session_(int index) {
+  if (index < 0 || index >= (int) this->sessions_.size()) return;
+  this->close_rtp_sockets_(index);
+  xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+  this->sessions_[index] = ClientSession{};
+  xSemaphoreGive(this->sessions_mutex_);
+  this->update_streaming_state_();
+}
+
+int RTSPAudioComponent::active_client_count_() const {
+  int count = 0;
+  for (const auto &s : this->sessions_) if (s.allocated) count++;
+  return count;
+}
+
+int RTSPAudioComponent::active_stream_count_() const {
+  int count = 0;
+  for (const auto &s : this->sessions_) if (s.allocated && s.playing && s.rtp_fd >= 0) count++;
+  return count;
+}
+
+void RTSPAudioComponent::update_streaming_state_() {
+  this->client_connected_ = this->active_client_count_() > 0;
+  this->streaming_ = this->active_stream_count_() > 0;
 }
 
 bool RTSPAudioComponent::read_rtsp_request_(int fd, std::string &request) {
@@ -386,8 +461,7 @@ void RTSPAudioComponent::send_rtsp_response_(int fd, int code, const char *reaso
   if (!body.empty()) send(fd, body.data(), body.size(), 0);
 }
 
-void RTSPAudioComponent::handle_rtsp_client_(int client_fd) {
-  std::string session = "12345678";
+void RTSPAudioComponent::handle_rtsp_client_(int client_fd, int session_index) {
   while (this->running_) {
     std::string req;
     if (!this->read_rtsp_request_(client_fd, req)) break;
@@ -395,10 +469,10 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd) {
     int cseq = this->parse_cseq_(req);
     std::string first = req.substr(0, req.find('\n'));
     if (!first.empty() && first.back() == '\r') first.pop_back();
-    if (this->debug_) ESP_LOGI(TAG, "RTSP request: %s", first.c_str());
+    if (this->debug_) ESP_LOGI(TAG, "RTSP[%d] request: %s", session_index, first.c_str());
 
     if (this->auth_enabled_ && req.rfind("OPTIONS", 0) != 0 && !this->request_authorized_(req)) {
-      if (this->debug_) ESP_LOGI(TAG, "RTSP request rejected: missing or invalid Basic auth");
+      if (this->debug_) ESP_LOGI(TAG, "RTSP[%d] request rejected: missing or invalid Basic auth", session_index);
       this->send_auth_required_(client_fd, cseq);
       continue;
     }
@@ -422,62 +496,86 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd) {
       ::sockaddr_in peer = {};
       socklen_t peer_len = sizeof(peer);
       getpeername(client_fd, (::sockaddr *) &peer, &peer_len);
-      this->close_rtp_sockets_();
-      this->rtp_fd_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-      this->rtcp_fd_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-      if (this->rtp_fd_ < 0 || this->rtcp_fd_ < 0) {
+      this->close_rtp_sockets_(session_index);
+
+      int rtp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+      int rtcp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+      if (rtp_fd < 0 || rtcp_fd < 0) {
+        if (rtp_fd >= 0) close(rtp_fd);
+        if (rtcp_fd >= 0) close(rtcp_fd);
         this->send_rtsp_response_(client_fd, 500, "Internal Server Error", cseq, "", "");
         continue;
       }
 
-      // A modest UDP send buffer reduces short Wi-Fi/lwIP backpressure bursts.
-      // Keep it conservative for non-PSRAM ESP32 boards.
       int sndbuf = 16 * 1024;
-      setsockopt(this->rtp_fd_, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+      setsockopt(rtp_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
       ::sockaddr_in local = {};
       local.sin_family = AF_INET;
       local.sin_addr.s_addr = htonl(INADDR_ANY);
       local.sin_port = 0;
-      bind(this->rtp_fd_, (::sockaddr *) &local, sizeof(local));
-      bind(this->rtcp_fd_, (::sockaddr *) &local, sizeof(local));
+      bind(rtp_fd, (::sockaddr *) &local, sizeof(local));
+      bind(rtcp_fd, (::sockaddr *) &local, sizeof(local));
       socklen_t llen = sizeof(local);
-      getsockname(this->rtp_fd_, (::sockaddr *) &local, &llen);
-      this->server_rtp_port_ = ntohs(local.sin_port);
-      getsockname(this->rtcp_fd_, (::sockaddr *) &local, &llen);
-      this->server_rtcp_port_ = ntohs(local.sin_port);
+      getsockname(rtp_fd, (::sockaddr *) &local, &llen);
+      int server_rtp_port = ntohs(local.sin_port);
+      getsockname(rtcp_fd, (::sockaddr *) &local, &llen);
+      int server_rtcp_port = ntohs(local.sin_port);
 
-      this->client_rtp_addr_ = new ::sockaddr_in();
-      this->client_rtcp_addr_ = new ::sockaddr_in();
-      *this->client_rtp_addr_ = peer;
-      *this->client_rtcp_addr_ = peer;
-      this->client_rtp_addr_->sin_port = htons(client_rtp);
-      this->client_rtcp_addr_->sin_port = htons(client_rtcp);
+      xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+      auto &sess = this->sessions_[session_index];
+      sess.rtp_fd = rtp_fd;
+      sess.rtcp_fd = rtcp_fd;
+      sess.server_rtp_port = server_rtp_port;
+      sess.server_rtcp_port = server_rtcp_port;
+      sess.client_rtp_addr = peer;
+      sess.client_rtcp_addr = peer;
+      sess.client_rtp_addr.sin_port = htons(client_rtp);
+      sess.client_rtcp_addr.sin_port = htons(client_rtcp);
+      std::string session = sess.session_id;
+      xSemaphoreGive(this->sessions_mutex_);
 
       char h[256];
       snprintf(h, sizeof(h),
                "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=%d-%d\r\n"
                "Session: %s\r\n",
-               client_rtp, client_rtcp, this->server_rtp_port_, this->server_rtcp_port_, session.c_str());
+               client_rtp, client_rtcp, server_rtp_port, server_rtcp_port, session.c_str());
       this->send_rtsp_response_(client_fd, 200, "OK", cseq, h, "");
-      ESP_LOGI(TAG, "RTSP SETUP complete: client RTP/RTCP %d/%d, server RTP/RTCP %d/%d", client_rtp, client_rtcp,
-               this->server_rtp_port_, this->server_rtcp_port_);
+      ESP_LOGI(TAG, "RTSP[%d] SETUP complete: client RTP/RTCP %d/%d, server RTP/RTCP %d/%d", session_index,
+               client_rtp, client_rtcp, server_rtp_port, server_rtcp_port);
     } else if (req.rfind("PLAY", 0) == 0) {
-      if (this->rtp_fd_ < 0 || this->client_rtp_addr_ == nullptr) {
+      bool ok = false;
+      uint16_t seq = 0;
+      uint32_t ts = 0;
+      std::string session;
+      bool was_any_streaming = this->active_stream_count_() > 0;
+      xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+      if (session_index >= 0 && session_index < (int) this->sessions_.size()) {
+        auto &sess = this->sessions_[session_index];
+        ok = sess.allocated && sess.rtp_fd >= 0;
+        if (ok) {
+          sess.playing = true;
+          seq = sess.rtp_sequence;
+          ts = sess.rtp_timestamp;
+          session = sess.session_id;
+        }
+      }
+      xSemaphoreGive(this->sessions_mutex_);
+      if (!ok) {
         this->send_rtsp_response_(client_fd, 454, "Session Not Found", cseq, "", "");
         continue;
       }
-      if (this->audio_buffer_ != nullptr) xStreamBufferReset(this->audio_buffer_);
-      this->streaming_ = true;
+      if (!was_any_streaming && this->audio_buffer_ != nullptr) xStreamBufferReset(this->audio_buffer_);
+      this->update_streaming_state_();
       if (this->rtp_task_handle_ == nullptr) {
         xTaskCreatePinnedToCore(&RTSPAudioComponent::rtp_task_trampoline_, "rtsp_audio_rtp", 8192, this, 6,
                                 &this->rtp_task_handle_, 1);
       }
-      std::string h = "Session: " + session + "\r\nRTP-Info: url=trackID=0;seq=0;rtptime=0\r\n";
+      char h[128];
+      snprintf(h, sizeof(h), "Session: %s\r\nRTP-Info: url=trackID=0;seq=%u;rtptime=%" PRIu32 "\r\n", session.c_str(), seq, ts);
       this->send_rtsp_response_(client_fd, 200, "OK", cseq, h, "");
-      ESP_LOGI(TAG, "RTSP PLAY; streaming started");
+      ESP_LOGI(TAG, "RTSP[%d] PLAY; active streams=%d", session_index, this->active_stream_count_());
     } else if (req.rfind("TEARDOWN", 0) == 0) {
-      this->streaming_ = false;
       this->send_rtsp_response_(client_fd, 200, "OK", cseq, "", "");
       break;
     } else {
@@ -491,14 +589,35 @@ void RTSPAudioComponent::rtp_task_() {
   const int output_samples_per_packet = std::max(80, (this->output_sample_rate_ * this->packet_ms_) / 1000);
   const size_t bytes_per_output_sample = (this->codec_ == AudioCodec::L16) ? 2U : 1U;
 
-  // MicrophoneSource always hands us 16-bit signed PCM (we requested it that way in setup()).
+  struct RtpTarget {
+    int index;
+    int fd;
+    ::sockaddr_in addr;
+    uint32_t ssrc;
+    uint16_t sequence;
+    uint32_t timestamp;
+  };
+
   std::vector<uint8_t> input(input_samples_per_packet * 2);
   std::vector<uint8_t> packet(12 + output_samples_per_packet * bytes_per_output_sample);
-  ESP_LOGI(TAG, "RTP task started: codec=%s input=%d Hz output=%d Hz, %d ms packets",
-           this->rtpmap_name_(), this->sample_rate_, this->output_sample_rate_, this->packet_ms_);
+  std::vector<RtpTarget> targets;
+  targets.reserve(6);
+
+  ESP_LOGI(TAG, "RTP task started: codec=%s input=%d Hz output=%d Hz, %d ms packets, max_clients=%d",
+           this->rtpmap_name_(), this->sample_rate_, this->output_sample_rate_, this->packet_ms_, this->max_clients_);
 
   while (this->running_) {
-    if (!this->streaming_ || this->rtp_fd_ < 0 || this->client_rtp_addr_ == nullptr) {
+    targets.clear();
+    xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+    for (int i = 0; i < (int) this->sessions_.size(); i++) {
+      const auto &sess = this->sessions_[i];
+      if (sess.allocated && sess.playing && sess.rtp_fd >= 0) {
+        targets.push_back(RtpTarget{i, sess.rtp_fd, sess.client_rtp_addr, sess.ssrc, sess.rtp_sequence, sess.rtp_timestamp});
+      }
+    }
+    xSemaphoreGive(this->sessions_mutex_);
+
+    if (targets.empty()) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
@@ -534,16 +653,6 @@ void RTSPAudioComponent::rtp_task_() {
 
     packet[0] = 0x80;
     packet[1] = (uint8_t) (this->rtp_payload_type_ & 0x7F);
-    packet[2] = (uint8_t) (this->rtp_sequence_ >> 8);
-    packet[3] = (uint8_t) (this->rtp_sequence_ & 0xFF);
-    packet[4] = (uint8_t) (this->rtp_timestamp_ >> 24);
-    packet[5] = (uint8_t) (this->rtp_timestamp_ >> 16);
-    packet[6] = (uint8_t) (this->rtp_timestamp_ >> 8);
-    packet[7] = (uint8_t) (this->rtp_timestamp_ & 0xFF);
-    packet[8] = (uint8_t) (this->ssrc_ >> 24);
-    packet[9] = (uint8_t) (this->ssrc_ >> 16);
-    packet[10] = (uint8_t) (this->ssrc_ >> 8);
-    packet[11] = (uint8_t) (this->ssrc_ & 0xFF);
 
     size_t payload_len = 0;
     for (int out_i = 0; out_i < output_samples; out_i++) {
@@ -573,38 +682,93 @@ void RTSPAudioComponent::rtp_task_() {
     this->last_max_ = max_sample;
     this->last_peak_ = peak_sample;
 
-    int sent = sendto(this->rtp_fd_, packet.data(), 12 + payload_len, 0, (::sockaddr *) this->client_rtp_addr_, sizeof(::sockaddr_in));
-    if (sent < 0) {
-      this->rtp_send_errors_++;
-      uint32_t t = now_ms();
-      if (t - this->last_send_error_log_ms_ > 2000) {
-        this->last_send_error_log_ms_ = t;
-        ESP_LOGW(TAG, "RTP sendto failed: %s", strerror(errno));
+    for (const auto &target : targets) {
+      packet[2] = (uint8_t) (target.sequence >> 8);
+      packet[3] = (uint8_t) (target.sequence & 0xFF);
+      packet[4] = (uint8_t) (target.timestamp >> 24);
+      packet[5] = (uint8_t) (target.timestamp >> 16);
+      packet[6] = (uint8_t) (target.timestamp >> 8);
+      packet[7] = (uint8_t) (target.timestamp & 0xFF);
+      packet[8] = (uint8_t) (target.ssrc >> 24);
+      packet[9] = (uint8_t) (target.ssrc >> 16);
+      packet[10] = (uint8_t) (target.ssrc >> 8);
+      packet[11] = (uint8_t) (target.ssrc & 0xFF);
+
+      int sent = sendto(target.fd, packet.data(), 12 + payload_len, 0, (::sockaddr *) &target.addr, sizeof(::sockaddr_in));
+      if (sent < 0) {
+        int err = errno;
+
+        // A client may TEARDOWN/disconnect between taking the target snapshot
+        // above and this sendto(). In that case the RTP socket has already
+        // been closed by the RTSP control task and lwIP returns EBADF. This is
+        // expected during normal disconnects, so don't count or log it as a
+        // streaming problem.
+        if (err == EBADF || err == ENOTSOCK) {
+          ESP_LOGD(TAG, "RTP session %d closed while sending; ignoring final packet", target.index);
+          continue;
+        }
+
+        this->rtp_send_errors_++;
+        uint32_t t = now_ms();
+        if (t - this->last_send_error_log_ms_ > 2000) {
+          this->last_send_error_log_ms_ = t;
+          ESP_LOGW(TAG, "RTP packet send failed for session %d: %s", target.index, strerror(err));
+        }
+        continue;
       }
-      vTaskDelay(pdMS_TO_TICKS(1));
-      continue;
+
+      xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+      if (target.index >= 0 && target.index < (int) this->sessions_.size()) {
+        auto &sess = this->sessions_[target.index];
+        if (sess.allocated && sess.playing) {
+          sess.rtp_sequence++;
+          sess.rtp_timestamp += output_samples;
+        }
+      }
+      xSemaphoreGive(this->sessions_mutex_);
     }
+
     this->rtp_packets_++;
-    this->rtp_sequence_++;
-    this->rtp_timestamp_ += output_samples;
+    vTaskDelay(1);
   }
   ESP_LOGI(TAG, "RTP task stopped");
 }
 
-void RTSPAudioComponent::close_rtp_sockets_() {
-  this->streaming_ = false;
-  if (this->rtp_fd_ >= 0) {
-    close(this->rtp_fd_);
-    this->rtp_fd_ = -1;
+void RTSPAudioComponent::close_rtp_sockets_(int index) {
+  if (index < 0 || index >= (int) this->sessions_.size()) return;
+
+  int rtp_fd = -1;
+  int rtcp_fd = -1;
+  xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+  auto &sess = this->sessions_[index];
+  sess.playing = false;
+  rtp_fd = sess.rtp_fd;
+  rtcp_fd = sess.rtcp_fd;
+  sess.rtp_fd = -1;
+  sess.rtcp_fd = -1;
+  sess.server_rtp_port = 0;
+  sess.server_rtcp_port = 0;
+  xSemaphoreGive(this->sessions_mutex_);
+
+  if (rtp_fd >= 0) close(rtp_fd);
+  if (rtcp_fd >= 0) close(rtcp_fd);
+  this->update_streaming_state_();
+}
+
+void RTSPAudioComponent::close_all_client_sessions_() {
+  for (int i = 0; i < (int) this->sessions_.size(); i++) {
+    if (this->sessions_[i].allocated) {
+      int fd = -1;
+      xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+      fd = this->sessions_[i].control_fd;
+      xSemaphoreGive(this->sessions_mutex_);
+      this->close_rtp_sockets_(i);
+      if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+      }
+    }
   }
-  if (this->rtcp_fd_ >= 0) {
-    close(this->rtcp_fd_);
-    this->rtcp_fd_ = -1;
-  }
-  delete this->client_rtp_addr_;
-  delete this->client_rtcp_addr_;
-  this->client_rtp_addr_ = nullptr;
-  this->client_rtcp_addr_ = nullptr;
 }
 
 std::string RTSPAudioComponent::local_ip_() const {
@@ -645,18 +809,18 @@ void RTSPAudioComponent::loop() {
 
 void RTSPAudioComponent::log_status_(const char *reason) {
   ESP_LOGI(TAG,
-           "RTSP native status [%s]: started=%s mic_running=%s client=%s streaming=%s ip=%s port=%d free_heap=%u "
+           "RTSP native status [%s]: started=%s mic_running=%s clients=%d/%d streams=%d ip=%s port=%d free_heap=%u "
            "codec=%s/%d packets=%u send_err=%u clip=%u reads=%u empty=%u drop=%u bytes=%u peak=%d min=%d max=%d last_error=%s",
            reason, YESNO(this->started_.load()),
-           YESNO(this->mic_source_ != nullptr && this->mic_source_->is_running()), YESNO(this->client_connected_.load()),
-           YESNO(this->streaming_.load()), this->local_ip_().c_str(), this->port_, (unsigned) esp_get_free_heap_size(),
+           YESNO(this->mic_source_ != nullptr && this->mic_source_->is_running()), this->active_client_count_(), this->max_clients_,
+           this->active_stream_count_(), this->local_ip_().c_str(), this->port_, (unsigned) esp_get_free_heap_size(),
            this->rtpmap_name_(), this->output_sample_rate_, (unsigned) this->rtp_packets_.load(), (unsigned) this->rtp_send_errors_.load(),
            (unsigned) this->clipped_samples_.load(), (unsigned) this->i2s_reads_.load(), (unsigned) this->i2s_empty_reads_.load(), (unsigned) this->dropped_bytes_.load(), (unsigned) this->last_bytes_read_.load(),
            (int) this->last_peak_.load(), (int) this->last_min_.load(), (int) this->last_max_.load(), this->last_error_.c_str());
 }
 
 void RTSPAudioComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Native RTSP Audio (microphone-source) v4-codecs");
+  ESP_LOGCONFIG(TAG, "Native RTSP Audio (microphone-source) v5-multiclient");
   ESP_LOGCONFIG(TAG, "  Port: %d", this->port_);
   ESP_LOGCONFIG(TAG, "  Microphone sample rate: %d Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Encoder codec: %s", this->codec_name_());
@@ -665,6 +829,7 @@ void RTSPAudioComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Gain factor: %d", (int) this->gain_factor_);
   ESP_LOGCONFIG(TAG, "  Packet duration: %d ms", this->packet_ms_);
   ESP_LOGCONFIG(TAG, "  Audio buffer: %d ms", this->buffer_ms_);
+  ESP_LOGCONFIG(TAG, "  Max clients: %d", this->max_clients_);
   ESP_LOGCONFIG(TAG, "  Authentication: %s", YESNO(this->auth_enabled_));
   if (this->auth_enabled_) {
     ESP_LOGCONFIG(TAG, "  Auth realm: %s", this->auth_realm_.c_str());
@@ -680,17 +845,12 @@ void RTSPAudioComponent::dump_config() {
 void RTSPAudioComponent::stop_server_() {
   this->running_ = false;
   this->streaming_ = false;
-  if (this->client_fd_ >= 0) {
-    shutdown(this->client_fd_, SHUT_RDWR);
-    close(this->client_fd_);
-    this->client_fd_ = -1;
-  }
+  this->close_all_client_sessions_();
   if (this->server_fd_ >= 0) {
     shutdown(this->server_fd_, SHUT_RDWR);
     close(this->server_fd_);
     this->server_fd_ = -1;
   }
-  this->close_rtp_sockets_();
 }
 
 void RTSPAudioComponent::on_shutdown() {
