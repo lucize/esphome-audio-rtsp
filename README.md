@@ -20,7 +20,7 @@ Supported today:
   - `l16` - signed 16-bit PCM, default, highest compatibility/quality
   - `pcmu` - G.711 mu-law, RTP static payload type 0 by default
   - `pcma` - G.711 A-law, RTP static payload type 8 by default
-- One active RTSP client at a time
+- Up to 6 simultaneous RTSP clients with `max_clients`
 - Optional RTSP Basic authentication
 
 
@@ -29,7 +29,6 @@ Not supported yet:
 - RTSP interleaved TCP RTP
 - RTSP Digest authentication
 - AAC/Opus encoding
-- Multiple simultaneous RTSP clients
 - Full resampling/filtering; G.711 uses simple nearest-sample downsampling when the microphone runs above the output rate
   
 ## Runtime behavior and optimizations
@@ -39,6 +38,8 @@ The component intentionally uses ESPHome's native `i2s_audio:` / `microphone:` s
 Current low-risk optimizations:
 
 - RTP sender task is separate from the RTSP control task.
+- Audio is captured/encoded once per packet, then the RTP payload is sent to every active client.
+- Each RTSP client has its own RTP sockets, sequence number, timestamp and SSRC.
 - Microphone callbacks never block; overflow is counted as `drop=` in debug logs.
 - The audio buffer trigger is aligned to one RTP packet instead of waking on tiny partial chunks.
 - The audio buffer is reset on `PLAY` to avoid stale buffered audio and reduce initial delay.
@@ -161,6 +162,7 @@ rtsp_audio:
   port: 8554
   audio_channel: 0          # microphone output channel index; mono mic = 0
   gain_factor: 4            # 1-64 integer gain
+  max_clients: 2            # 1-6 simultaneous clients
   # Encoder. Use l16 for best quality, or pcmu/pcma for lower bandwidth.
   codec: l16
   # For codec: pcmu/pcma, uncomment this for standard G.711 RTP:
@@ -176,6 +178,25 @@ rtsp_audio:
   password: !secret rtsp_password
   auth_realm: ESPHome RTSP Audio
 ```
+
+## Multiple clients
+
+The component supports up to 6 simultaneous RTSP clients:
+
+```yaml
+rtsp_audio:
+  microphone: inmp441_mic
+  max_clients: 6
+```
+
+`max_clients` accepts values from `1` to `6`. The audio path is shared: the microphone is captured once, the selected codec is encoded once per RTP packet, then the same payload is sent to each active client with per-client RTP headers. This keeps CPU usage low, but Wi-Fi bandwidth still scales with the number of clients.
+
+Suggested limits:
+
+- `l16`: 1-2 clients is safest on normal ESP32 Wi-Fi.
+- `pcmu` / `pcma`: 4-6 clients is more realistic because G.711 uses much less bandwidth.
+
+Extra clients above `max_clients` are rejected with `503 Service Unavailable`.
 
 ## G.711 example
 
@@ -258,6 +279,7 @@ ffplay rtsp://mic-front.local:8554/
 | `rtp_payload_type` | no | codec-specific | Optional RTP payload override. Defaults: L16=`96`, PCMU=`0`, PCMA=`8`. |
 | `packet_ms` | no | `20` | Audio per RTP packet, in milliseconds. |
 | `buffer_ms` | no | `200` | Microphone-to-RTP buffer size in milliseconds. Lower reduces latency; higher tolerates more jitter. |
+| `max_clients` | no | `2` | Maximum simultaneous RTSP control sessions/active RTP clients. Range: 1-6. |
 | `debug` | no | `false` | Enables periodic status/debug logging. |
 | `status_interval` | no | `10s` | Debug status log interval. |
 | `username` | no | | RTSP Basic auth username. Must be set together with `password`. |
